@@ -39,6 +39,7 @@
     rawTree: [],
     fileIndex: new Map(),
     fileBytes: new Map(),
+    fileRequests: new Map(),
     originalBytes: new Map(),
     sourceTextCache: new Map(),
     changes: new Map(),
@@ -58,8 +59,12 @@
     compilerHydrated: false,
     compilerHydrating: false,
     compilerHydrationPromise: null,
+    compilerHydrationTail: Promise.resolve(),
     compilerReady: false,
     editor: null,
+    editorInitPromise: null,
+    runtimeInitPromise: null,
+    repositoryLoadSerial: 0,
     editorModel: null,
     suppressEditorChange: false,
     monaco: null,
@@ -260,8 +265,6 @@
     loadToken();
     bindEvents();
     renderRecents();
-    await initMonaco();
-    configureTypstRuntime();
     validateStoredToken();
     route();
   }
@@ -395,7 +398,39 @@
     });
   }
 
+  // Only editor routes need these large, version-pinned CDN dependencies.
+  // Share startup across route changes and allow a failed download to be retried.
+  function loadScript(src, type = '') {
+    return new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = src;
+      if (type) script.type = type;
+      const finish = (err) => {
+        clearTimeout(timer);
+        script.onload = script.onerror = null;
+        if (err) { script.remove(); reject(err); }
+        else resolve();
+      };
+      const timer = setTimeout(() => finish(new Error('Editor dependency timed out. Check the browser network connection.')), 60000);
+      script.onload = () => finish();
+      script.onerror = () => finish(new Error('Editor dependency did not load. Check the browser network connection or content-blocking settings.'));
+      document.head.appendChild(script);
+    });
+  }
+
+  function ensureMonaco() {
+    if (state.editor) return Promise.resolve();
+    if (!state.editorInitPromise) {
+      state.editorInitPromise = initMonaco().catch(err => {
+        state.editorInitPromise = null;
+        throw err;
+      });
+    }
+    return state.editorInitPromise;
+  }
+
   async function initMonaco() {
+    if (!window.require) await loadScript('https://cdn.jsdelivr.net/npm/monaco-editor@0.56.0/min/vs/loader.js');
     if (!window.require) throw new Error('Monaco loader did not load.');
     window.require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.56.0/min/vs' } });
     await new Promise((resolve, reject) => {
@@ -678,34 +713,37 @@
     });
   }
 
-  function configureTypstRuntime() {
-    const script = $('typst-runtime');
-    const configure = () => {
-      if (!window.$typst) return;
-      try {
+  function ensureTypstRuntime() {
+    if (!state.runtimeInitPromise) {
+      state.runtimeInitPromise = (async () => {
+        if (!window.$typst) await loadScript('https://cdn.jsdelivr.net/npm/@myriaddreamin/typst.ts@0.8.0-rc3/dist/esm/contrib/all-in-one-lite.bundle.js', 'module');
+        if (!window.$typst) throw new Error('Typst runtime did not initialize.');
         window.$typst.setCompilerInitOptions({
           getModule: () => 'https://cdn.jsdelivr.net/npm/@myriaddreamin/typst-ts-web-compiler@0.8.0-rc3/pkg/typst_ts_web_compiler_bg.wasm',
         });
         window.$typst.setRendererInitOptions({
           getModule: () => 'https://cdn.jsdelivr.net/npm/@myriaddreamin/typst-ts-renderer@0.8.0-rc3/pkg/typst_ts_renderer_bg.wasm',
         });
-      } catch (err) {
-        // It may already be initialized after returning to the home page.
-        console.debug('Typst runtime already initialized', err);
-      }
-      state.compilerReady = true;
-    };
-    if (window.$typst) configure();
-    else script.addEventListener('load', configure, { once: true });
+        state.compilerReady = true;
+      })().catch(err => {
+        state.runtimeInitPromise = null;
+        throw err;
+      });
+    }
+    return state.runtimeInitPromise;
   }
 
   function route() {
     const parsed = parseHash();
+    if (parsed?.type === 'repo' && isRepositoryLoaded(parsed.owner, parsed.repo, parsed.branch)) return;
+    const serial = ++state.repositoryLoadSerial;
     if (!parsed || parsed.type === 'home') {
       showHome();
       return;
     }
-    if (parsed.type === 'repo') openRepository(parsed.owner, parsed.repo, parsed.branch).catch(handleFatalRepoError);
+    if (parsed.type === 'repo') openRepository(parsed.owner, parsed.repo, parsed.branch, serial).catch(err => {
+      if (serial === state.repositoryLoadSerial) handleFatalRepoError(err);
+    });
   }
 
   function parseHash() {
@@ -721,6 +759,10 @@
   }
 
   function showHome() {
+    clearTimeout(state.compileTimer);
+    state.compileTimer = null;
+    state.compileSerial++;
+    cancelPreviewSourceAnchorIndexing();
     els['editor-view'].classList.add('hidden');
     els['home-view'].classList.remove('hidden');
     renderRecents();
@@ -755,15 +797,31 @@
     return { owner, repo };
   }
 
-  async function openRepository(owner, repo, requestedBranch) {
-    if (!els['editor-view'].classList.contains('hidden') && state.repo?.owner?.login === owner && state.repo?.name === repo && state.branch === requestedBranch) return;
+  function isRepositoryLoaded(owner, repo, requestedBranch) {
+    return !els['editor-view'].classList.contains('hidden') && state.editor && state.headSha &&
+      (!state.mainPath || (state.openPath && state.compilerHydrated)) &&
+      state.repo?.owner?.login === owner && state.repo?.name === repo &&
+      state.branch === (requestedBranch || state.repo.default_branch);
+  }
+
+  async function openRepository(owner, repo, requestedBranch, serial) {
+    if (isRepositoryLoaded(owner, repo, requestedBranch)) return;
+    if (serial === undefined) serial = ++state.repositoryLoadSerial;
     resetProjectState();
     els['home-view'].classList.add('hidden');
     els['editor-view'].classList.remove('hidden');
     setCompileStatus('busy', 'Loading repository');
     setSyncStatus('Reading GitHub…');
 
+    const editorReady = ensureMonaco();
+    // Attach handlers immediately while repository requests run in parallel.
+    editorReady.catch(() => {});
+    ensureTypstRuntime().catch(err => {
+      if (serial === state.repositoryLoadSerial) showCompileError(err);
+    });
+
     const meta = await github.getRepo(owner, repo);
+    if (serial !== state.repositoryLoadSerial) return;
     state.repo = meta;
     state.branch = requestedBranch || meta.default_branch;
     updateRepoHeader();
@@ -772,24 +830,30 @@
       github.getBranches(owner, repo).catch(() => []),
       github.getRef(owner, repo, state.branch)
     ]);
+    if (serial !== state.repositoryLoadSerial) return;
     state.branches = branches;
     renderBranches();
-    await loadTreeAtRef(ref.object.sha);
+    if (!await loadTreeAtRef(ref.object.sha, serial)) return;
     chooseInitialMainFile();
     renderFileTree();
     addRecentProject();
 
     if (state.mainPath) await openFile(state.mainPath);
-    else showNoTypstFiles();
+    else { await editorReady; if (serial === state.repositoryLoadSerial) showNoTypstFiles(); }
+    if (serial !== state.repositoryLoadSerial) return;
 
     setSyncStatus(`GitHub • ${state.branch}`);
-    hydrateCompilerFS().then(() => scheduleCompile(0)).catch(showCompileError);
+    hydrateCompilerFS().then(() => {
+      if (serial === state.repositoryLoadSerial) scheduleCompile(0);
+    }).catch(showCompileError);
   }
 
-  async function loadTreeAtRef(commitSha) {
+  async function loadTreeAtRef(commitSha, serial = state.repositoryLoadSerial) {
     const { owner, name: repo } = state.repo;
     const commit = await github.getCommit(owner.login, repo, commitSha);
+    if (serial !== state.repositoryLoadSerial) return false;
     const tree = await github.getTree(owner.login, repo, commit.tree.sha);
+    if (serial !== state.repositoryLoadSerial) return false;
     if (tree.truncated) toast('This repository is very large. GitHub returned a truncated file tree.', 'error', 6000);
     state.headSha = commitSha;
     state.baseTreeSha = commit.tree.sha;
@@ -798,6 +862,7 @@
     for (const item of state.rawTree) if (item.type === 'blob') state.fileIndex.set(item.path, { ...item, existing: true });
     invalidatePathCaches();
     els['file-count-label'].textContent = `${state.fileIndex.size} files`;
+    return true;
   }
 
   function resetProjectState() {
@@ -806,7 +871,7 @@
     clearTimeout(state.editorSyncTimer);
     cancelPreviewSourceAnchorIndexing();
     state.repo = null; state.branch = null; state.branches = []; state.headSha = null; state.baseTreeSha = null;
-    state.rawTree = []; state.fileIndex = new Map(); state.fileBytes = new Map(); state.originalBytes = new Map(); state.sourceTextCache = new Map(); state.changes = new Map();
+    state.rawTree = []; state.fileIndex = new Map(); state.fileBytes = new Map(); state.fileRequests = new Map(); state.originalBytes = new Map(); state.sourceTextCache = new Map(); state.changes = new Map();
     state.pathsCache = null; state.typPathsCache = null; state.treeCache = null; state.fileTreeRows = new Map(); state.fileTreeRenderTimer = null;
     state.editorSyncTimer = null; state.editorSyncPending = false; state.editorSyncPath = null; state.shadowSyncPromise = null;
     state.openPath = null; state.mainPath = null; state.deletedPaths = new Set(); state.expandedFolders = new Set();
@@ -856,19 +921,26 @@
   }
 
   async function openRepositoryForce(owner, repo, branch) {
+    const serial = ++state.repositoryLoadSerial;
     resetProjectState();
     setCompileStatus('busy', 'Reloading repository');
     const meta = await github.getRepo(owner, repo);
+    if (serial !== state.repositoryLoadSerial) return;
     state.repo = meta; state.branch = branch || meta.default_branch;
     updateRepoHeader();
-    const ref = await github.getRef(owner, repo, state.branch);
-    state.branches = await github.getBranches(owner, repo).catch(() => []);
+    const [ref, branches] = await Promise.all([
+      github.getRef(owner, repo, state.branch),
+      github.getBranches(owner, repo).catch(() => [])
+    ]);
+    if (serial !== state.repositoryLoadSerial) return;
+    state.branches = branches;
     renderBranches();
-    await loadTreeAtRef(ref.object.sha);
+    if (!await loadTreeAtRef(ref.object.sha, serial)) return;
     chooseInitialMainFile();
     renderFileTree();
     addRecentProject();
     if (state.mainPath) await openFile(state.mainPath);
+    if (serial !== state.repositoryLoadSerial) return;
     setSyncStatus(`GitHub • ${state.branch}`);
     await hydrateCompilerFS();
     await compilePreview();
@@ -996,7 +1068,9 @@
     const changed = state.changes.has(path);
     row.innerHTML = `<span class="chevron"></span><span class="file-type-icon ${icon.cls}">${icon.label}</span><span class="file-label">${escapeHtml(flat ? path : basename(path))}</span>${changed ? '<span class="tree-dirty">●</span>' : ''}`;
     row.title = path;
-    row.addEventListener('click', () => openFile(path).catch(err => toast(err.message,'error')));
+    row.addEventListener('click', () => openFile(path).catch(err => {
+      if (err?.name !== 'AbortError') toast(err.message,'error');
+    }));
     return row;
   }
 
@@ -1084,18 +1158,37 @@
 
   async function getFileBytes(path) {
     if (state.fileBytes.has(path)) return state.fileBytes.get(path);
+    if (state.fileRequests.has(path)) return state.fileRequests.get(path);
     const meta = state.fileIndex.get(path);
     if (!meta) throw new Error(`File not found: ${path}`);
     if (!meta.existing && meta.bytes) {
       state.fileBytes.set(path, meta.bytes); return meta.bytes;
     }
     if (meta.size > MAX_SINGLE_BLOB_BYTES) throw new Error(`${path} is too large to load in this editor (${formatBytes(meta.size)}).`);
-    const blob = await github.getBlob(state.repo.owner.login, state.repo.name, meta.sha);
-    const bytes = base64ToBytes(blob.content);
-    state.fileBytes.set(path, bytes);
-    if (!state.originalBytes.has(path)) state.originalBytes.set(path, bytes.slice());
-    if (isTextPath(path) && !looksBinary(bytes)) state.sourceTextCache.set(path, decoder.decode(bytes));
-    return bytes;
+    const requests = state.fileRequests;
+    const fileIndex = state.fileIndex;
+    const { owner, name } = state.repo;
+    const request = (async () => {
+      const blob = await github.getBlob(owner.login, name, meta.sha);
+      // A late response must not populate a different project or replaced file.
+      if (state.fileRequests !== requests || state.fileIndex !== fileIndex || fileIndex.get(path) !== meta) {
+        const error = new Error('Project changed while loading a file.');
+        error.name = 'AbortError';
+        throw error;
+      }
+      const bytes = base64ToBytes(blob.content);
+      state.fileBytes.set(path, bytes);
+      if (!state.originalBytes.has(path)) state.originalBytes.set(path, bytes.slice());
+      if (isTextPath(path) && !looksBinary(bytes)) state.sourceTextCache.set(path, decoder.decode(bytes));
+      return bytes;
+    })();
+    requests.set(path, request);
+    try {
+      return await request;
+    } finally {
+      // Rejections can be retried, and old projects cannot clear new requests.
+      if (requests.get(path) === request) requests.delete(path);
+    }
   }
 
   function isTextPath(path) {
@@ -1104,9 +1197,13 @@
   }
 
   async function openFile(path) {
+    const serial = state.repositoryLoadSerial;
+    const fileIndex = state.fileIndex;
     if (state.deletedPaths.has(path)) return;
     if (state.openPath && state.openPath !== path) await flushEditorSync();
-    const bytes = await getFileBytes(path);
+    if (serial !== state.repositoryLoadSerial || fileIndex !== state.fileIndex) return;
+    const [bytes] = await Promise.all([getFileBytes(path), ensureMonaco()]);
+    if (serial !== state.repositoryLoadSerial || fileIndex !== state.fileIndex) return;
     state.openPath = path;
     const expanded = expandParents(path);
     if (expanded) renderFileTree();
@@ -1232,17 +1329,27 @@
     if (state.compilerHydrated && !force) return;
     if (state.compilerHydrationPromise && !force) return state.compilerHydrationPromise;
 
-    const hydration = (async () => {
+    const serial = state.repositoryLoadSerial;
+    const fileIndex = state.fileIndex;
+    const checkCurrent = () => assertCurrentRepository(serial, fileIndex);
+    // Typst has one shared shadow FS. Finish old reset/map operations before
+    // hydrating a new project, even when the old hydration was cancelled.
+    const hydration = state.compilerHydrationTail.then(async () => {
+      checkCurrent();
       state.compilerHydrating = true;
       try {
         setCompileStatus('busy', 'Loading project files');
         await waitForTypstRuntime();
+        checkCurrent();
         if (state.compilerNeedsReset && typeof window.$typst.getCompiler === 'function') {
           const compiler = await window.$typst.getCompiler();
+          checkCurrent();
           await compiler.reset();
+          checkCurrent();
           state.compilerNeedsReset = false;
         }
         await window.$typst.resetShadow();
+        checkCurrent();
 
         const entries = [...state.fileIndex.entries()].filter(([path, meta]) =>
           !state.deletedPaths.has(path) && (meta.size || 0) <= MAX_SINGLE_BLOB_BYTES
@@ -1253,6 +1360,7 @@
         // the selected main document instead of downloading every repository
         // blob. Dynamic file access falls back to the force-hydration retry.
         let selected = force ? entries : await collectCompilerDependencyEntries(entries);
+        checkCurrent();
         let selectedTotal = selected.reduce((sum, [, meta]) => sum + (meta.size || 0), 0);
         if (selectedTotal > MAX_PROJECT_BYTES || (force && allTotal > MAX_PROJECT_BYTES)) {
           selected = entries.filter(([path]) => shouldHydratePriority(path));
@@ -1263,8 +1371,11 @@
         let done = 0;
         const mappedPaths = new Set();
         await pooled(selected, 8, async ([path]) => {
+          checkCurrent();
           const bytes = await getFileBytes(path);
+          checkCurrent();
           const mapped = await window.$typst.mapShadow(`/repo/${path}`, bytes);
+          checkCurrent();
           if (mapped === false) throw new Error(`Typst could not map project file: ${path}`);
           mappedPaths.add(path);
           done++;
@@ -1272,22 +1383,30 @@
             setCompileStatus('busy', `Loading files ${done}/${selected.length}`);
           }
         });
+        checkCurrent();
 
         for (const [path, change] of state.changes) {
+          checkCurrent();
           if (change.type === 'delete') await window.$typst.unmapShadow(`/repo/${path}`);
           else if (!mappedPaths.has(path) && change.bytes) {
             const mapped = await window.$typst.mapShadow(`/repo/${path}`, change.bytes);
+            checkCurrent();
             if (mapped === false) throw new Error(`Typst could not map changed file: ${path}`);
           }
+          checkCurrent();
         }
 
         state.compilerHydrated = true;
         setCompileStatus('busy', 'Compiling');
+      } catch (err) {
+        checkCurrent();
+        throw err;
       } finally {
-        state.compilerHydrating = false;
+        if (serial === state.repositoryLoadSerial && fileIndex === state.fileIndex) state.compilerHydrating = false;
       }
-    })();
+    });
 
+    state.compilerHydrationTail = hydration.catch(() => {});
     state.compilerHydrationPromise = hydration;
     try {
       return await hydration;
@@ -1296,12 +1415,21 @@
     }
   }
 
+  function assertCurrentRepository(serial, fileIndex) {
+    if (serial === state.repositoryLoadSerial && fileIndex === state.fileIndex) return;
+    const error = new Error('Project changed while loading compiler files.');
+    error.name = 'AbortError';
+    throw error;
+  }
+
   function shouldHydratePriority(path) {
     const e = ext(path);
     return e === 'typ' || IMAGE_EXTENSIONS.has(e) || DATA_EXTENSIONS.has(e) || FONT_EXTENSIONS.has(e) || ['pdf','svg','txt','md','markdown'].includes(e);
   }
 
   async function collectCompilerDependencyEntries(entries) {
+    const serial = state.repositoryLoadSerial;
+    const fileIndex = state.fileIndex;
     const byPath = new Map(entries);
     const selected = new Set();
     const typQueue = [];
@@ -1324,28 +1452,39 @@
     for (const [path] of entries) if (FONT_EXTENSIONS.has(ext(path))) addPath(path);
 
     while (typQueue.length) {
-      const path = typQueue.shift();
-      let text = '';
-      try {
-        const bytes = await getFileBytes(path);
-        text = sourceText(path) || decoder.decode(bytes);
-      } catch {
-        continue;
-      }
+      const level = typQueue.splice(0);
+      const texts = new Map();
+      // Sibling imports are independent: fetch a level in parallel, then parse
+      // in queue order so dependency and source-search ordering stays stable.
+      await pooled(level, 8, async path => {
+        try {
+          assertCurrentRepository(serial, fileIndex);
+          const bytes = await getFileBytes(path);
+          assertCurrentRepository(serial, fileIndex);
+          texts.set(path, sourceText(path) || decoder.decode(bytes));
+        } catch (err) {
+          if (err?.name === 'AbortError') throw err;
+          // Preserve the existing compiler diagnostic/fallback behavior.
+        }
+      });
+      for (const path of level) {
+        if (!texts.has(path)) continue;
+        const text = texts.get(path);
 
-      // Literal module references.
-      const moduleRegex = /#?\s*(?:include|import)\s*(?:\(\s*)?["']([^"']+)["']/g;
-      let match;
-      while ((match = moduleRegex.exec(text))) {
-        const ref = resolveTypstReference(path, match[1]);
-        if (ref) addPath(ref);
-      }
+        // Literal module references.
+        const moduleRegex = /#?\s*(?:include|import)\s*(?:\(\s*)?["']([^"']+)["']/g;
+        let match;
+        while ((match = moduleRegex.exec(text))) {
+          const ref = resolveTypstReference(path, match[1]);
+          if (ref) addPath(ref);
+        }
 
-      // Common repo-backed data and asset functions.
-      const fileRegex = /#?\s*(?:image|bibliography|csv|json|yaml|xml|read)\s*\(\s*["']([^"']+)["']/g;
-      while ((match = fileRegex.exec(text))) {
-        const ref = resolveTypstReference(path, match[1]);
-        if (ref) addPath(ref);
+        // Common repo-backed data and asset functions.
+        const fileRegex = /#?\s*(?:image|bibliography|csv|json|yaml|xml|read)\s*\(\s*["']([^"']+)["']/g;
+        while ((match = fileRegex.exec(text))) {
+          const ref = resolveTypstReference(path, match[1]);
+          if (ref) addPath(ref);
+        }
       }
     }
 
@@ -1356,26 +1495,22 @@
 
   async function pooled(items, concurrency, fn) {
     let index = 0;
+    let failed = false;
+    let failure;
     const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
-      while (index < items.length) {
+      while (!failed && index < items.length) {
         const i = index++;
-        await fn(items[i], i);
+        try { await fn(items[i], i); }
+        catch (err) { if (!failed) { failed = true; failure = err; } }
       }
     });
+    // A rejected worker must not leave shadow-FS writes running after callers
+    // release the hydration queue to the next project.
     await Promise.all(workers);
+    if (failed) throw failure;
   }
 
-  function waitForTypstRuntime(timeout = 15000) {
-    const start = Date.now();
-    return new Promise((resolve, reject) => {
-      const tick = () => {
-        if (window.$typst && state.compilerReady) return resolve();
-        if (Date.now() - start > timeout) return reject(new Error('Typst WebAssembly runtime did not load. Check the browser network connection or content-blocking settings.'));
-        setTimeout(tick, 80);
-      };
-      tick();
-    });
-  }
+  function waitForTypstRuntime() { return ensureTypstRuntime(); }
 
   function scheduleCompile(delay = 400) {
     clearTimeout(state.compileTimer);
@@ -1392,42 +1527,53 @@
       return state.compilePromise;
     }
 
+    const repositorySerial = state.repositoryLoadSerial;
     state.compileInFlight = true;
-    state.compilePromise = (async () => {
+    const compilation = (async () => {
       try {
         do {
           state.compileQueued = false;
           await compilePreviewOnce();
-        } while (state.compileQueued);
+        } while (repositorySerial === state.repositoryLoadSerial && state.compileQueued);
       } finally {
-        state.compileInFlight = false;
-        state.compilePromise = null;
+        if (state.compilePromise === compilation) {
+          state.compileInFlight = false;
+          state.compilePromise = null;
+        }
       }
     })();
-    return state.compilePromise;
+    state.compilePromise = compilation;
+    return compilation;
   }
 
   async function compilePreviewOnce() {
     if (!state.mainPath) return;
+    const repositorySerial = state.repositoryLoadSerial;
     await flushEditorSync();
+    if (repositorySerial !== state.repositoryLoadSerial) return;
     const serial = ++state.compileSerial;
     hideDiagnostics();
     els['preview-loading'].classList.remove('hidden');
     setCompileStatus('busy', 'Compiling');
     await hydrateCompilerFS();
+    if (serial !== state.compileSerial) return;
 
     let result;
     try {
       result = await compileVectorWithDiagnostics();
+      if (serial !== state.compileSerial) return;
       if (hasAccessDeniedDiagnostic(result.diagnostics)) {
         state.compilerHydrated = false;
         await hydrateCompilerFS(true);
+        if (serial !== state.compileSerial) return;
         result = await compileVectorWithDiagnostics();
       }
     } catch (err) {
+      if (serial !== state.compileSerial) return;
       if (isAccessDeniedCompilerError(err)) {
         state.compilerHydrated = false;
         await hydrateCompilerFS(true);
+        if (serial !== state.compileSerial) return;
         result = await compileVectorWithDiagnostics();
       } else {
         throw err;
@@ -1719,6 +1865,7 @@
   }
 
   function showCompileError(err) {
+    if (err?.name === 'AbortError') return;
     console.error(err);
     els['preview-loading'].classList.add('hidden');
     const diagnostics = normalizeDiagnostics(Array.isArray(err) ? err : [err]);
@@ -2723,6 +2870,7 @@
     setTimeout(() => { el.style.opacity = '0'; el.style.transform = 'translateY(8px)'; setTimeout(()=>el.remove(),180); }, duration);
   }
   function handleFatalRepoError(err) {
+    if (err?.name === 'AbortError') return;
     console.error(err);
     setCompileStatus('error','Could not open repository');
     toast(err.status === 404 ? 'Repository not found or your GitHub token cannot access it.' : err.message, 'error', 6500);
