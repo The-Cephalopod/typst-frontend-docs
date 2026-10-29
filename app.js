@@ -52,6 +52,7 @@
     editorSyncPending: false,
     editorSyncPath: null,
     shadowSyncPromise: null,
+    shadowSyncTail: Promise.resolve(),
     openPath: null,
     mainPath: null,
     deletedPaths: new Set(),
@@ -64,6 +65,7 @@
     editor: null,
     editorInitPromise: null,
     runtimeInitPromise: null,
+    workerDisabled: false,
     repositoryLoadSerial: 0,
     editorModel: null,
     suppressEditorChange: false,
@@ -71,13 +73,16 @@
     editorResizeObserver: null,
     editorLayoutFrame: 0,
     compileTimer: null,
+    compileDueAt: 0,
     compileSerial: 0,
     compileInFlight: false,
     compileQueued: false,
     compilePromise: null,
+    editRevision: 0,
     compilerNeedsReset: true,
     previewZoom: 1,
     previewFit: false,
+    previewSvgCache: null,
     promptResolver: null,
     activeModal: null,
     diagnostics: [],
@@ -88,6 +93,7 @@
     previewHighlightTimer: null,
     previewIndexGeneration: 0,
     previewIndexHandle: null,
+    previewIndexStartTimer: null,
     imagePasteResolver: null,
     imagePasteContext: null,
   };
@@ -713,9 +719,118 @@
     });
   }
 
+  async function createWorkerTypstRuntime() {
+    const worker = new Worker(new URL('./typst-worker.js', document.baseURI), { type: 'module' });
+    const pending = new Map();
+    let nextId = 0;
+    let failure = null;
+    let ready = false;
+    let previewParts = null;
+    let service;
+    const fail = error => {
+      if (failure) return;
+      failure = error;
+      previewParts = null;
+      worker.terminate();
+      for (const task of pending.values()) task.reject(error);
+      pending.clear();
+      if (ready && window.$typst === service) {
+        // Recover through the compatibility runtime if a worker is unavailable.
+        window.$typst = null;
+        state.workerDisabled = true;
+        state.runtimeInitPromise = null;
+        state.compilerReady = false;
+        state.compilerHydrated = false;
+        state.compilerNeedsReset = true;
+      }
+    };
+    worker.onerror = event => {
+      event.preventDefault();
+      fail(new Error(event.message || 'The background Typst compiler stopped.'));
+    };
+    worker.onmessageerror = () => fail(new Error('The background Typst compiler returned an unreadable response.'));
+    worker.onmessage = event => {
+      const task = pending.get(event.data?.id);
+      if (!task) return;
+      pending.delete(event.data.id);
+      if (event.data.error) {
+        const error = new Error(event.data.error.message);
+        error.name = event.data.error.name || 'Error';
+        error.diagnostics = event.data.error.diagnostics;
+        task.reject(error);
+      } else task.resolve(event.data.result);
+    };
+    const request = (method, args = {}) => new Promise((resolve, reject) => {
+      if (failure) { reject(failure); return; }
+      const id = ++nextId;
+      pending.set(id, { resolve, reject });
+      try {
+        // Clone file buffers: transferring them would detach editor caches.
+        worker.postMessage({ id, method, args });
+      } catch (error) { pending.delete(id); reject(error); }
+    });
+    const compiler = {
+      reset: () => request('reset'),
+      compile: options => request('compile', { options }),
+    };
+    const preview = async options => {
+      let result = await request('compilePreview', { options, partsOnly: true, baseRevision: previewParts?.revision });
+      if (result.svgDelta && result.svgDelta.baseRevision !== previewParts?.revision) {
+        result = await request('compilePreview', { options, partsOnly: true });
+      }
+      if (result.svgDelta) {
+        const delta = result.svgDelta;
+        const pages = previewParts.pages.slice(0, delta.pageCount);
+        for (const patch of delta.patches) {
+          if (!Number.isInteger(patch.index) || patch.index < 0 || patch.index >= delta.pageCount || typeof patch.svg !== 'string') {
+            throw new Error('The background compiler returned an invalid page update.');
+          }
+          pages[patch.index] = patch.svg;
+        }
+        if (pages.length !== delta.pageCount || Array.from({ length: delta.pageCount }, (_, index) => typeof pages[index]).some(type => type !== 'string')) {
+          throw new Error('The background compiler returned an incomplete preview.');
+        }
+        result.svgParts = {
+          opening: delta.opening, prefix: delta.prefix, pages,
+          suffix: delta.suffix, closing: delta.closing, revision: delta.revision,
+        };
+        delete result.svgDelta;
+      }
+      if (result.svgParts) previewParts = result.svgParts;
+      else if (typeof result.svg === 'string') previewParts = null;
+      return result;
+    };
+    service = {
+      getCompiler: async () => compiler,
+      resetShadow: async () => { const result = await request('resetShadow'); previewParts = null; return result; },
+      mapShadow: (path, bytes) => request('mapShadow', { path, bytes }),
+      unmapShadow: path => request('unmapShadow', { path }),
+      compilePreview: preview,
+      svg: options => request('svg', options),
+      pdf: options => request('pdf', { options }),
+    };
+    const timeout = setTimeout(() => fail(new Error('Background Typst compiler initialization timed out.')), 60000);
+    try {
+      await request('init');
+      ready = true;
+      return service;
+    } catch (error) { fail(error); throw error; }
+    finally { clearTimeout(timeout); }
+  }
+
   function ensureTypstRuntime() {
     if (!state.runtimeInitPromise) {
       state.runtimeInitPromise = (async () => {
+        if (!window.$typst && !state.workerDisabled && typeof Worker === 'function') {
+          try {
+            window.$typst = await createWorkerTypstRuntime();
+            state.compilerReady = true;
+            return;
+          } catch (error) {
+            state.workerDisabled = true;
+            console.warn('Background Typst initialization failed; using the browser runtime.', error);
+          }
+        }
         if (!window.$typst) await loadScript('https://cdn.jsdelivr.net/npm/@myriaddreamin/typst.ts@0.8.0-rc3/dist/esm/contrib/all-in-one-lite.bundle.js', 'module');
         if (!window.$typst) throw new Error('Typst runtime did not initialize.');
         window.$typst.setCompilerInitOptions({
@@ -724,6 +839,11 @@
         window.$typst.setRendererInitOptions({
           getModule: () => 'https://cdn.jsdelivr.net/npm/@myriaddreamin/typst-ts-renderer@0.8.0-rc3/pkg/typst_ts_renderer_bg.wasm',
         });
+        // Pay initialization cost while the repository opens, before typing.
+        await Promise.all([
+          window.$typst.getCompiler?.(),
+          window.$typst.getRenderer?.(),
+        ]);
         state.compilerReady = true;
       })().catch(err => {
         state.runtimeInitPromise = null;
@@ -761,6 +881,7 @@
   function showHome() {
     clearTimeout(state.compileTimer);
     state.compileTimer = null;
+    state.compileDueAt = 0;
     state.compileSerial++;
     cancelPreviewSourceAnchorIndexing();
     els['editor-view'].classList.add('hidden');
@@ -867,6 +988,8 @@
 
   function resetProjectState() {
     clearTimeout(state.compileTimer);
+    state.compileTimer = null;
+    state.compileDueAt = 0;
     clearTimeout(state.fileTreeRenderTimer);
     clearTimeout(state.editorSyncTimer);
     cancelPreviewSourceAnchorIndexing();
@@ -878,6 +1001,8 @@
     state.compilerHydrated = false; state.compilerHydrating = false; state.compilerHydrationPromise = null; state.compilerNeedsReset = true;
     state.compileInFlight = false; state.compileQueued = false; state.compilePromise = null; state.compileSerial++;
     state.diagnostics = []; state.sourceSearchOrder = []; state.previewLastJump = null; state.previewSourceAnchors = []; state.previewAnchorMap = new WeakMap();
+    if (state.previewSvgCache?.mode === 'cards') els['preview-output'].style.gap = state.previewSvgCache.previousGap;
+    state.previewSvgCache = null;
     els['preview-output'].innerHTML = '';
     els['preview-error'].classList.add('hidden');
     els['diagnostic-list'].innerHTML = '';
@@ -1266,19 +1391,30 @@
       syncOpenFileFromEditor().catch(err => console.error('Editor sync failed', err));
     }, 90);
 
-    // Prevent an older compile from installing stale output.
-    state.compileSerial++;
-    if (ext(path) === 'typ' || path === state.mainPath) scheduleCompile(500);
+    // Publish completed snapshots while typing, then compile the newest edit.
+    // Cancelling every in-flight result would starve a long document's preview.
+    state.editRevision++;
+    cancelPreviewSourceAnchorIndexing();
+    state.previewSourceAnchors = [];
+    state.previewAnchorMap = new WeakMap();
+    if (state.mainPath) scheduleCompile();
     maybeTriggerTypstPathSuggestions(changeEvent);
   }
 
   async function syncOpenFileFromEditor() {
+    const serial = state.repositoryLoadSerial;
+    const fileIndex = state.fileIndex;
     if (!state.editorSyncPending || !state.editorSyncPath) {
       if (state.shadowSyncPromise) await state.shadowSyncPromise;
+      assertCurrentRepository(serial, fileIndex);
       return;
     }
     const path = state.editorSyncPath;
-    if (path !== state.openPath) return;
+    if (path !== state.openPath) {
+      const error = new Error('Editor file changed while syncing.');
+      error.name = 'AbortError';
+      throw error;
+    }
 
     clearTimeout(state.editorSyncTimer);
     state.editorSyncTimer = null;
@@ -1298,18 +1434,41 @@
     updateFileTreeDirtyIndicator(path);
 
     if (window.$typst) {
-      state.shadowSyncPromise = Promise.resolve(window.$typst.mapShadow(`/repo/${path}`, bytes))
-        .catch(err => { console.error(err); throw err; })
-        .finally(() => { state.shadowSyncPromise = null; });
-      await state.shadowSyncPromise;
+      const runtime = window.$typst;
+      // Keep writes ordered while allowing newer keystrokes to remain pending.
+      // This tail survives project resets until old writes have completed.
+      const sync = state.shadowSyncTail.then(async () => {
+        assertCurrentRepository(serial, fileIndex);
+        const mapped = await runtime.mapShadow(`/repo/${path}`, bytes);
+        assertCurrentRepository(serial, fileIndex);
+        if (mapped === false) throw new Error(`Typst could not update project file: ${path}`);
+      });
+      state.shadowSyncTail = sync.catch(() => {});
+      state.shadowSyncPromise = sync;
+      try {
+        await sync;
+      } catch (err) {
+        assertCurrentRepository(serial, fileIndex);
+        // A failed latest update stays available for the next compile/retry.
+        if (state.shadowSyncPromise === sync && !state.editorSyncPending && state.openPath === path) {
+          state.editorSyncPending = true;
+          state.editorSyncPath = path;
+        }
+        throw err;
+      } finally {
+        if (state.shadowSyncPromise === sync) state.shadowSyncPromise = null;
+      }
     }
   }
 
   async function flushEditorSync() {
-    for (let i = 0; i < 3; i++) {
+    const serial = state.repositoryLoadSerial;
+    const fileIndex = state.fileIndex;
+    while (true) {
+      assertCurrentRepository(serial, fileIndex);
       if (state.editorSyncPending) await syncOpenFileFromEditor();
       else if (state.shadowSyncPromise) await state.shadowSyncPromise;
-      else break;
+      else return;
     }
   }
 
@@ -1340,6 +1499,8 @@
       try {
         setCompileStatus('busy', 'Loading project files');
         await waitForTypstRuntime();
+        checkCurrent();
+        await state.shadowSyncTail;
         checkCurrent();
         if (state.compilerNeedsReset && typeof window.$typst.getCompiler === 'function') {
           const compiler = await window.$typst.getCompiler();
@@ -1512,10 +1673,21 @@
 
   function waitForTypstRuntime() { return ensureTypstRuntime(); }
 
-  function scheduleCompile(delay = 400) {
+  function scheduleCompile(delay = 40) {
+    if (!state.mainPath || els['editor-view'].classList.contains('hidden')) return;
+    if (state.compileInFlight) {
+      state.compileQueued = true;
+      return;
+    }
+    const dueAt = Date.now() + delay;
+    // Anchor the deadline to the first edit in a batch, rather than postponing
+    // it on every keystroke. Continuous typing must still produce previews.
+    if (state.compileTimer != null && state.compileDueAt <= dueAt) return;
     clearTimeout(state.compileTimer);
+    state.compileDueAt = dueAt;
     state.compileTimer = setTimeout(() => {
       state.compileTimer = null;
+      state.compileDueAt = 0;
       compilePreview().catch(showCompileError);
     }, delay);
   }
@@ -1530,10 +1702,22 @@
     const repositorySerial = state.repositoryLoadSerial;
     state.compileInFlight = true;
     const compilation = (async () => {
+      let failedRevision = null;
       try {
         do {
           state.compileQueued = false;
-          await compilePreviewOnce();
+          try {
+            await compilePreviewOnce();
+            failedRevision = null;
+          } catch (error) {
+            // A newer edit queued during a transient failure still needs its
+            // own pass. Retry at most once per revision to avoid a busy loop.
+            if (repositorySerial === state.repositoryLoadSerial && state.compileQueued && failedRevision !== state.editRevision) {
+              failedRevision = state.editRevision;
+              continue;
+            }
+            throw error;
+          }
         } while (repositorySerial === state.repositoryLoadSerial && state.compileQueued);
       } finally {
         if (state.compilePromise === compilation) {
@@ -1549,70 +1733,80 @@
   async function compilePreviewOnce() {
     if (!state.mainPath) return;
     const repositorySerial = state.repositoryLoadSerial;
-    await flushEditorSync();
+    const mainPath = state.mainPath;
+    const revision = state.editRevision;
+    // One ordered snapshot is enough for this preview. Commit/export still
+    // drain every pending edit; previews must not chase a moving typing stream.
+    await syncOpenFileFromEditor();
     if (repositorySerial !== state.repositoryLoadSerial) return;
     const serial = ++state.compileSerial;
-    hideDiagnostics();
-    els['preview-loading'].classList.remove('hidden');
+    const isCurrent = () => serial === state.compileSerial && mainPath === state.mainPath;
+    if (!els['preview-output'].querySelector('svg')) els['preview-loading'].classList.remove('hidden');
     setCompileStatus('busy', 'Compiling');
     await hydrateCompilerFS();
-    if (serial !== state.compileSerial) return;
+    if (!isCurrent()) return;
 
     let result;
     try {
       result = await compileVectorWithDiagnostics();
-      if (serial !== state.compileSerial) return;
+      if (!isCurrent()) return;
       if (hasAccessDeniedDiagnostic(result.diagnostics)) {
         state.compilerHydrated = false;
         await hydrateCompilerFS(true);
-        if (serial !== state.compileSerial) return;
+        if (!isCurrent()) return;
         result = await compileVectorWithDiagnostics();
       }
     } catch (err) {
-      if (serial !== state.compileSerial) return;
+      if (!isCurrent()) return;
       if (isAccessDeniedCompilerError(err)) {
         state.compilerHydrated = false;
         await hydrateCompilerFS(true);
-        if (serial !== state.compileSerial) return;
+        if (!isCurrent()) return;
         result = await compileVectorWithDiagnostics();
       } else {
         throw err;
       }
     }
 
-    if (serial !== state.compileSerial) return;
+    if (!isCurrent()) return;
     const diagnostics = normalizeDiagnostics(result?.diagnostics || []);
-    state.diagnostics = diagnostics;
-    renderDiagnostics(diagnostics);
-
     const errors = diagnostics.filter(d => d.severity === 'error');
     const warnings = diagnostics.filter(d => d.severity === 'warning');
-    if (!result?.result) {
+    const hasPreview = typeof result?.svg === 'string' || result?.svgParts || result?.result;
+    if (!hasPreview) {
+      // Incomplete syntax during typing should not flash an obsolete error or
+      // remove the last successful preview. A quiet latest edit shows diagnostics.
+      if (revision !== state.editRevision) return;
+      state.diagnostics = diagnostics;
+      renderDiagnostics(diagnostics);
       els['preview-loading'].classList.add('hidden');
-      els['preview-output'].innerHTML = '';
-      state.previewSourceAnchors = [];
-      state.previewAnchorMap = new WeakMap();
       els['download-pdf-btn'].disabled = true;
       if (!diagnostics.length) throw new Error('Typst compilation failed without a diagnostic message.');
       setCompileStatus('error', errors.length === 1 ? '1 error' : `${errors.length} errors`);
       return;
     }
 
-    const svg = await window.$typst.svg({ vectorData: result.result });
-    if (serial !== state.compileSerial) return;
-    els['preview-output'].innerHTML = svg || '';
+    const svg = result.svgParts ? (result.svg || '') : (typeof result.svg === 'string' ? result.svg : await window.$typst.svg({ vectorData: result.result }));
+    if (!isCurrent()) return;
+    state.diagnostics = diagnostics;
+    renderDiagnostics(diagnostics);
+    installPreviewSvg(svg, result.svgParts);
     els['preview-loading'].classList.add('hidden');
     normalizePreviewSvg();
     state.sourceSearchOrder = buildSourceSearchOrder();
     schedulePreviewSourceAnchorIndexing();
     setPreviewZoom(state.previewZoom, false);
     els['download-pdf-btn'].disabled = false;
-    if (errors.length) setCompileStatus('error', errors.length === 1 ? '1 error' : `${errors.length} errors`);
+    if (state.compileQueued || revision !== state.editRevision) setCompileStatus('busy', 'Compiling');
+    else if (errors.length) setCompileStatus('error', errors.length === 1 ? '1 error' : `${errors.length} errors`);
     else if (warnings.length) setCompileStatus('warn', warnings.length === 1 ? '1 warning' : `${warnings.length} warnings`);
     else setCompileStatus('ok', 'Up to date');
   }
 
   async function compileVectorWithDiagnostics() {
+    if (typeof window.$typst.compilePreview === 'function') {
+      return window.$typst.compilePreview({ mainFilePath: `/repo/${state.mainPath}`, root: '/repo', diagnostics: 'full' });
+    }
     if (typeof window.$typst.getCompiler === 'function') {
       const compiler = await window.$typst.getCompiler();
       return compiler.compile({
@@ -1887,28 +2081,282 @@
     try { return JSON.stringify(err, null, 2); } catch { return String(err); }
   }
 
+  function installPreviewSvg(svg, parts) {
+    const output = els['preview-output'];
+    const validParts = parts && ['opening', 'prefix', 'suffix', 'closing'].every(key => typeof parts[key] === 'string') &&
+      Array.isArray(parts.pages) && parts.pages.length && parts.pages.every(page => typeof page === 'string');
+    const completeSvg = () => svg || (validParts ? parts.opening + parts.prefix + parts.pages.join('') + parts.suffix + parts.closing : '');
+    const SVG_NS = 'http://www.w3.org/2000/svg';
+    const parseNodes = markup => {
+      const holder = document.createElementNS(SVG_NS, 'svg');
+      holder.innerHTML = markup;
+      return Array.from(holder.childNodes);
+    };
+    const setAttribute = (node, name, value) => {
+      const text = String(value);
+      if (node.getAttribute(name) !== text) node.setAttribute(name, text);
+    };
+    const applyAttributes = (node, template) => {
+      for (const attribute of Array.from(node.attributes)) {
+        if (!template.hasAttribute(attribute.name)) node.removeAttribute(attribute.name);
+      }
+      for (const attribute of Array.from(template.attributes)) setAttribute(node, attribute.name, attribute.value);
+    };
+    const patchNodes = (parent, previous, fresh, anchor = null) => {
+      const key = (node, index) => node.nodeType === 1 && node.id ? `id:${node.id}` : `${node.nodeType}:${node.localName || ''}:${index}`;
+      const byKey = new Map(previous.map((node, index) => [key(node, index), node]));
+      const retained = new Set();
+      const nodes = fresh.map((node, index) => {
+        const old = byKey.get(key(node, index));
+        if (!old) return node;
+        if (old.isEqualNode(node)) { retained.add(old); return old; }
+        if (old.nodeType === 1 && node.nodeType === 1 && old.localName === node.localName &&
+          old.namespaceURI === node.namespaceURI && old.localName !== 'script') {
+          // Replacing a shared glyph definition invalidates every SVG using it.
+          // Preserve unchanged definitions when just one clip/glyph changes.
+          applyAttributes(old, node);
+          patchNodes(old, Array.from(old.childNodes), Array.from(node.childNodes));
+          retained.add(old);
+          return old;
+        }
+        return node;
+      });
+      previous.forEach(node => { if (!retained.has(node)) node.remove(); });
+      let next = anchor;
+      for (let index = nodes.length - 1; index >= 0; index--) {
+        const node = nodes[index];
+        if (node.parentNode !== parent || node.nextSibling !== next) parent.insertBefore(node, next);
+        next = node;
+      }
+      return nodes;
+    };
+    const installCards = () => {
+      let cache = state.previewSvgCache;
+      const reusable = cache?.mode === 'cards' && cache.root.parentNode === output &&
+        cache.pages.every(page => page.node.parentNode === output);
+      const holder = document.createElement('div');
+      holder.innerHTML = reusable ? parts.opening + parts.closing : completeSvg();
+      const template = holder.firstElementChild;
+      if (template?.localName !== 'svg' || holder.children.length !== 1) return false;
+      const initialGroups = reusable ? [] : Array.from(template.querySelectorAll(':scope > g.typst-page'));
+      if (!reusable && initialGroups.length !== parts.pages.length) return false;
+      const changed = new Map();
+      for (let index = 0; index < parts.pages.length; index++) {
+        if (reusable && cache.pages[index]?.raw === parts.pages[index]) continue;
+        const group = reusable ? parseNodes(parts.pages[index]).find(node => node.nodeType === 1) : initialGroups[index];
+        const width = parseFloat(group?.getAttribute('data-page-width'));
+        const height = parseFloat(group?.getAttribute('data-page-height'));
+        if (group?.localName !== 'g' || !group.classList.contains('typst-page') || !(width > 0 && height > 0)) return false;
+        changed.set(index, { group, width, height });
+      }
+      const pageTemplate = template.cloneNode(false);
+      pageTemplate.removeAttribute('id');
+      pageTemplate.classList.add('typst-doc', 'preview-page-surface');
+      Object.assign(pageTemplate.style, {
+        display: 'block', background: 'transparent', border: '0', boxShadow: 'none',
+        borderRadius: '0', overflow: 'visible', filter: 'none',
+      });
+      if (!reusable) {
+        const children = Array.from(template.childNodes);
+        cache = {
+          mode: 'cards', root: template, opening: parts.opening, prefix: parts.prefix, suffix: parts.suffix,
+          prefixNodes: children.slice(0, children.indexOf(initialGroups[0])),
+          suffixNodes: children.slice(children.indexOf(initialGroups[initialGroups.length - 1]) + 1),
+          pages: [], previousGap: state.previewSvgCache?.mode === 'cards' ? state.previewSvgCache.previousGap : output.style.gap,
+        };
+      }
+      const root = cache.root;
+      if (reusable && cache.opening !== parts.opening) applyAttributes(root, template);
+      const rootStyles = {
+        position: 'absolute', width: '0px', height: '0px', overflow: 'hidden',
+        background: 'transparent', border: '0', boxShadow: 'none', pointerEvents: 'none',
+      };
+      for (const [name, value] of Object.entries(rootStyles)) if (root.style[name] !== value) root.style[name] = value;
+      setAttribute(root, 'width', 0); setAttribute(root, 'height', 0);
+      setAttribute(root, 'aria-hidden', 'true');
+      for (let index = 0; index < parts.pages.length; index++) {
+        const update = changed.get(index);
+        let record = cache.pages[index];
+        if (!record) {
+          const node = document.createElement('div');
+          node.className = 'preview-page-card';
+          Object.assign(node.style, { contain: 'layout style', flex: '0 0 auto', filter: 'drop-shadow(0 6px 13px rgba(0,0,0,.28))' });
+          const pageSvg = pageTemplate.cloneNode(false);
+          const background = document.createElementNS(SVG_NS, 'rect');
+          background.classList.add('preview-page-background');
+          setAttribute(background, 'x', 0); setAttribute(background, 'y', 0);
+          setAttribute(background, 'fill', '#ffffff'); setAttribute(background, 'pointer-events', 'none');
+          pageSvg.appendChild(background); node.appendChild(pageSvg);
+          record = { raw: null, node, svg: pageSvg, background, group: null };
+          cache.pages[index] = record;
+        }
+        if (update) {
+          if (update.group.hasAttribute('transform')) update.group.removeAttribute('transform');
+          if (record.group) record.group.replaceWith(update.group);
+          else record.svg.appendChild(update.group);
+          Object.assign(record, update, { raw: parts.pages[index] });
+        }
+        if (!reusable || cache.opening !== parts.opening) {
+          setAttribute(pageTemplate, 'width', record.width); setAttribute(pageTemplate, 'height', record.height);
+          setAttribute(pageTemplate, 'viewBox', `0 0 ${record.width} ${record.height}`);
+          pageTemplate.style.width = `${record.width}px`; pageTemplate.style.height = `${record.height}px`;
+          applyAttributes(record.svg, pageTemplate);
+        }
+        for (const [name, value] of Object.entries({ width: `${record.width}px`, height: `${record.height}px`, containIntrinsicSize: `${record.width}px ${record.height}px` })) {
+          if (record.node.style[name] !== value) record.node.style[name] = value;
+        }
+        setAttribute(record.node, 'data-page-number', index + 1);
+        setAttribute(record.svg, 'width', record.width); setAttribute(record.svg, 'height', record.height);
+        setAttribute(record.svg, 'viewBox', `0 0 ${record.width} ${record.height}`);
+        setAttribute(record.svg, 'data-page-number', index + 1);
+        if (record.svg.style.width !== `${record.width}px`) record.svg.style.width = `${record.width}px`;
+        if (record.svg.style.height !== `${record.height}px`) record.svg.style.height = `${record.height}px`;
+        setAttribute(record.background, 'width', record.width); setAttribute(record.background, 'height', record.height);
+        if (reusable && record.node.parentNode !== output) output.appendChild(record.node);
+      }
+      for (const record of cache.pages.slice(parts.pages.length)) record.node.remove();
+      cache.pages.length = parts.pages.length;
+      if (reusable && cache.prefix !== parts.prefix) {
+        cache.prefixNodes = patchNodes(root, cache.prefixNodes, parseNodes(parts.prefix), cache.suffixNodes.find(node => node.parentNode === root) || null);
+      }
+      if (reusable && cache.suffix !== parts.suffix) {
+        cache.suffixNodes = patchNodes(root, cache.suffixNodes, parseNodes(parts.suffix));
+      }
+      if (!reusable) output.replaceChildren(root, ...cache.pages.map(page => page.node));
+      if (output.style.gap !== '16px') output.style.gap = '16px';
+      cache.opening = parts.opening; cache.prefix = parts.prefix; cache.suffix = parts.suffix;
+      cache.width = Math.max(...cache.pages.map(page => page.width));
+      cache.height = cache.pages.reduce((sum, page) => sum + page.height, 0) + 16 * (cache.pages.length - 1);
+      setAttribute(root, 'data-base-width', cache.width); setAttribute(root, 'data-base-height', cache.height);
+      state.previewSvgCache = cache;
+      return true;
+    };
+    if (validParts && parts.pages.length > 8 && installCards()) return;
+    const replaceAll = () => {
+      if (state.previewSvgCache?.mode === 'cards') output.style.gap = state.previewSvgCache.previousGap;
+      output.innerHTML = completeSvg();
+      state.previewSvgCache = null;
+      if (!validParts || output.children.length !== 1) return;
+      const root = output.firstElementChild;
+      const groups = Array.from(root.querySelectorAll(':scope > g.typst-page'));
+      if (root.localName !== 'svg' || groups.length !== parts.pages.length) return;
+      const children = Array.from(root.childNodes);
+      state.previewSvgCache = {
+        root, opening: parts.opening, prefix: parts.prefix, suffix: parts.suffix,
+        prefixNodes: children.slice(0, children.indexOf(groups[0])),
+        suffixNodes: children.slice(children.indexOf(groups[groups.length - 1]) + 1),
+        pages: groups.map((group, index) => ({ raw: parts.pages[index], group, node: group })),
+      };
+    };
+    let cache = state.previewSvgCache;
+    if (!validParts || !cache || cache.root.parentNode !== output || output.children.length !== 1 ||
+      cache.pages.some(page => page.node.parentNode !== cache.root)) {
+      replaceAll();
+      return;
+    }
+
+    // Parse only changed pages. Shared glyph definitions can change while
+    // unchanged pages continue to reference them through their existing DOM.
+    const changed = new Map();
+    for (let index = 0; index < parts.pages.length; index++) {
+      if (cache.pages[index]?.raw === parts.pages[index]) continue;
+      const nodes = parseNodes(parts.pages[index]);
+      const group = nodes.find(node => node.nodeType === 1);
+      if (!group || group.localName !== 'g' || !group.classList.contains('typst-page') ||
+        nodes.some(node => node !== group && (node.nodeType !== 3 || node.textContent.trim()))) {
+        replaceAll();
+        return;
+      }
+      changed.set(index, group);
+    }
+
+    const root = cache.root;
+    if (cache.opening !== parts.opening) {
+      const holder = document.createElement('div');
+      holder.innerHTML = parts.opening + parts.closing;
+      const freshRoot = holder.firstElementChild;
+      if (freshRoot?.localName !== 'svg' || holder.children.length !== 1) { replaceAll(); return; }
+      const generatedClass = root.classList.contains('typst-paged-document');
+      // Keep preview sizing metadata until normalization recomputes page gaps.
+      for (const attribute of Array.from(root.attributes)) {
+        if (!freshRoot.hasAttribute(attribute.name) && !['data-base-width', 'data-base-height', 'data-page-number'].includes(attribute.name)) {
+          root.removeAttribute(attribute.name);
+        }
+      }
+      for (const attribute of Array.from(freshRoot.attributes)) {
+        if (root.getAttribute(attribute.name) !== attribute.value) root.setAttribute(attribute.name, attribute.value);
+      }
+      if (generatedClass) root.classList.add('typst-paged-document');
+      cache.opening = parts.opening;
+    }
+
+    for (let index = 0; index < parts.pages.length; index++) {
+      const group = changed.get(index);
+      if (!group) continue;
+      const previous = cache.pages[index];
+      let node = group;
+      if (previous) {
+        if (previous.node !== previous.group) {
+          node = previous.node;
+          if (group.hasAttribute('transform')) node.dataset.originalPageTransform = group.getAttribute('transform');
+          else delete node.dataset.originalPageTransform;
+          previous.group.replaceWith(group);
+        } else previous.node.replaceWith(group);
+      } else {
+        root.insertBefore(group, cache.suffixNodes.find(node => node.parentNode === root) || null);
+      }
+      cache.pages[index] = { raw: parts.pages[index], group, node };
+    }
+    for (const page of cache.pages.slice(parts.pages.length)) page.node.remove();
+    cache.pages.length = parts.pages.length;
+
+    if (cache.prefix !== parts.prefix) {
+      cache.prefixNodes = patchNodes(root, cache.prefixNodes, parseNodes(parts.prefix), cache.pages[0].node);
+      cache.prefix = parts.prefix;
+    }
+    if (cache.suffix !== parts.suffix) {
+      cache.suffixNodes = patchNodes(root, cache.suffixNodes, parseNodes(parts.suffix));
+      cache.suffix = parts.suffix;
+    }
+  }
+
   function normalizePreviewSvg() {
     const output = els['preview-output'];
+    if (state.previewSvgCache?.mode === 'cards' && state.previewSvgCache.root.parentNode === output) {
+      const label = `${state.previewSvgCache.pages.length} pages`;
+      if (els['preview-page-label'].textContent !== label) els['preview-page-label'].textContent = label;
+      return;
+    }
     const renderedSvgs = Array.from(output.querySelectorAll(':scope > svg'));
     if (!renderedSvgs.length) return;
 
     let totalPages = 0;
     const SVG_NS = 'http://www.w3.org/2000/svg';
     const pageGap = 16;
+    const setAttribute = (node, name, value) => {
+      const text = String(value);
+      if (node.getAttribute(name) !== text) node.setAttribute(name, text);
+    };
+    const setStyle = (node, name, value) => { if (node.style[name] !== value) node.style[name] = value; };
 
     renderedSvgs.forEach(documentSvg => {
       // typst.ts renders a paged document as one SVG whose direct
       // <g class="typst-page"> children are stacked vertically.
-      const typstPages = Array.from(documentSvg.querySelectorAll(':scope > g.typst-page'));
+      const typstPages = Array.from(documentSvg.children).flatMap(node => {
+        if (node.matches('g.typst-page')) return [{ group: node, viewport: null }];
+        if (node.matches('svg.preview-page-surface')) {
+          const group = node.querySelector(':scope > g.typst-page');
+          if (group) return [{ group, viewport: node }];
+        }
+        return [];
+      });
+      const pageInfo = typstPages.map(page => ({
+        ...page,
+        width: parseFloat(page.group.getAttribute('data-page-width')),
+        height: parseFloat(page.group.getAttribute('data-page-height')),
+      }));
 
-      if (typstPages.length > 1) {
-        const pageInfo = typstPages.map(group => ({
-          group,
-          width: parseFloat(group.getAttribute('data-page-width')),
-          height: parseFloat(group.getAttribute('data-page-height')),
-        })).filter(page => page.width > 0 && page.height > 0);
-
-        if (pageInfo.length) {
+      if (pageInfo.length > 1 && pageInfo.every(page => page.width > 0 && page.height > 0)) {
           const maxWidth = Math.max(...pageInfo.map(page => page.width));
           const totalHeight = pageInfo.reduce((sum, page) => sum + page.height, 0) + pageGap * (pageInfo.length - 1);
           let y = 0;
@@ -1917,63 +2365,81 @@
             // Keep the renderer's shared defs/styles once on the outer SVG.
             // Each real Typst page gets its own nested SVG viewport so the
             // preview background can show through between pages.
-            const pageViewport = document.createElementNS(SVG_NS, 'svg');
-            pageViewport.classList.add('preview-page-surface');
-            pageViewport.dataset.pageNumber = String(index + 1);
-            pageViewport.setAttribute('x', String((maxWidth - page.width) / 2));
-            pageViewport.setAttribute('y', String(y));
-            pageViewport.setAttribute('width', String(page.width));
-            pageViewport.setAttribute('height', String(page.height));
-            pageViewport.setAttribute('viewBox', `0 0 ${page.width} ${page.height}`);
-            pageViewport.setAttribute('preserveAspectRatio', 'xMidYMid meet');
-            pageViewport.setAttribute('overflow', 'visible');
+            const pageViewport = page.viewport || document.createElementNS(SVG_NS, 'svg');
+            if (!pageViewport.classList.contains('preview-page-surface')) pageViewport.classList.add('preview-page-surface');
+            setAttribute(pageViewport, 'data-page-number', index + 1);
+            setAttribute(pageViewport, 'x', (maxWidth - page.width) / 2);
+            setAttribute(pageViewport, 'y', y);
+            setAttribute(pageViewport, 'width', page.width);
+            setAttribute(pageViewport, 'height', page.height);
+            setAttribute(pageViewport, 'viewBox', `0 0 ${page.width} ${page.height}`);
+            setAttribute(pageViewport, 'preserveAspectRatio', 'xMidYMid meet');
+            setAttribute(pageViewport, 'overflow', 'visible');
 
-            const background = document.createElementNS(SVG_NS, 'rect');
-            background.classList.add('preview-page-background');
-            background.setAttribute('x', '0');
-            background.setAttribute('y', '0');
-            background.setAttribute('width', String(page.width));
-            background.setAttribute('height', String(page.height));
-            background.setAttribute('fill', '#ffffff');
-            background.setAttribute('pointer-events', 'none');
-            pageViewport.appendChild(background);
+            const background = pageViewport.querySelector(':scope > rect.preview-page-background') || document.createElementNS(SVG_NS, 'rect');
+            if (!background.classList.contains('preview-page-background')) background.classList.add('preview-page-background');
+            setAttribute(background, 'x', 0);
+            setAttribute(background, 'y', 0);
+            setAttribute(background, 'width', page.width);
+            setAttribute(background, 'height', page.height);
+            setAttribute(background, 'fill', '#ffffff');
+            setAttribute(background, 'pointer-events', 'none');
+            if (background.parentNode !== pageViewport) pageViewport.prepend(background);
 
             // The original transform is only the cumulative vertical offset
             // used to make Typst's flat SVG continuous. The nested viewport
             // supplies the new position, so the page content becomes local.
-            page.group.removeAttribute('transform');
-            pageViewport.appendChild(page.group);
-            documentSvg.appendChild(pageViewport);
+            if (!page.viewport) {
+              if (page.group.hasAttribute('transform')) pageViewport.dataset.originalPageTransform = page.group.getAttribute('transform');
+              page.group.replaceWith(pageViewport);
+              pageViewport.appendChild(page.group);
+            }
+            if (page.group.hasAttribute('transform')) page.group.removeAttribute('transform');
+            const record = state.previewSvgCache?.root === documentSvg && state.previewSvgCache.pages[index];
+            if (record) record.node = pageViewport;
             y += page.height + pageGap;
           });
 
-          documentSvg.classList.add('typst-paged-document');
-          documentSvg.setAttribute('width', String(maxWidth));
-          documentSvg.setAttribute('height', String(totalHeight));
-          documentSvg.setAttribute('viewBox', `0 0 ${maxWidth} ${totalHeight}`);
-          documentSvg.dataset.baseWidth = String(maxWidth);
-          documentSvg.dataset.baseHeight = String(totalHeight);
-          documentSvg.style.width = `${maxWidth}px`;
-          documentSvg.style.height = `${totalHeight}px`;
+          if (!documentSvg.classList.contains('typst-paged-document')) documentSvg.classList.add('typst-paged-document');
+          setAttribute(documentSvg, 'width', maxWidth);
+          setAttribute(documentSvg, 'height', totalHeight);
+          setAttribute(documentSvg, 'viewBox', `0 0 ${maxWidth} ${totalHeight}`);
+          setAttribute(documentSvg, 'data-base-width', maxWidth);
+          setAttribute(documentSvg, 'data-base-height', totalHeight);
+          setStyle(documentSvg, 'width', `${maxWidth}px`);
+          setStyle(documentSvg, 'height', `${totalHeight}px`);
           totalPages += pageInfo.length;
           return;
-        }
+      }
+
+      if (pageInfo.length === 1 && pageInfo[0].viewport) {
+        const page = pageInfo[0];
+        const originalTransform = page.viewport.dataset.originalPageTransform;
+        if (originalTransform !== undefined) setAttribute(page.group, 'transform', originalTransform);
+        page.viewport.replaceWith(page.group);
+        const record = state.previewSvgCache?.root === documentSvg && state.previewSvgCache.pages[0];
+        if (record) record.node = page.group;
+        documentSvg.classList.remove('typst-paged-document');
+        setAttribute(documentSvg, 'width', page.width);
+        setAttribute(documentSvg, 'height', page.height);
+        setAttribute(documentSvg, 'viewBox', `0 0 ${page.width} ${page.height}`);
       }
 
       // Single-page documents and older renderer layouts need no restructuring.
       const w = parseFloat(documentSvg.getAttribute('width'));
       const h = parseFloat(documentSvg.getAttribute('height'));
       if (w && h) {
-        documentSvg.dataset.baseWidth = w;
-        documentSvg.dataset.baseHeight = h;
-        documentSvg.style.width = `${w}px`;
-        documentSvg.style.height = `${h}px`;
+        setAttribute(documentSvg, 'data-base-width', w);
+        setAttribute(documentSvg, 'data-base-height', h);
+        setStyle(documentSvg, 'width', `${w}px`);
+        setStyle(documentSvg, 'height', `${h}px`);
       }
-      documentSvg.dataset.pageNumber = String(totalPages + 1);
+      setAttribute(documentSvg, 'data-page-number', totalPages + 1);
       totalPages += Math.max(1, typstPages.length);
     });
 
-    els['preview-page-label'].textContent = totalPages === 1 ? '1 page' : `${totalPages} pages`;
+    const pageLabel = totalPages === 1 ? '1 page' : `${totalPages} pages`;
+    if (els['preview-page-label'].textContent !== pageLabel) els['preview-page-label'].textContent = pageLabel;
   }
 
   async function exportPdf() {
@@ -1997,7 +2463,12 @@
     if (updateFit) state.previewFit = false;
     els['zoom-reset-btn'].textContent = `${Math.round(state.previewZoom * 100)}%`;
     els['preview-output'].style.transform = `scale(${state.previewZoom})`;
-    els['preview-output'].style.marginBottom = `${Math.max(0, (state.previewZoom - 1) * (els['preview-output'].scrollHeight || 0))}px`;
+    // At normal/reduced zoom this margin is zero. Reading scrollHeight here
+    // would still force layout of every page immediately after an SVG update.
+    const documents = state.previewZoom > 1 ? Array.from(els['preview-output'].querySelectorAll(':scope > svg')) : [];
+    const baseHeight = documents.reduce((sum, svg) => sum + (parseFloat(svg.dataset.baseHeight || svg.getAttribute('height')) || 0), 0) + Math.max(0, documents.length - 1) * 16;
+    const extraHeight = (state.previewZoom - 1) * baseHeight;
+    els['preview-output'].style.marginBottom = `${extraHeight}px`;
   }
   function fitPreviewWidth() {
     const svg = els['preview-output'].querySelector('svg');
@@ -2243,6 +2714,9 @@
   }
 
   function sourceText(path) {
+    if (state.editor && state.editorSyncPending && state.editorSyncPath === path && state.openPath === path) {
+      return state.editor.getValue();
+    }
     if (state.sourceTextCache.has(path)) return state.sourceTextCache.get(path);
     const bytes = state.fileBytes.get(path);
     if (!bytes) return '';
@@ -2447,6 +2921,8 @@
 
   function cancelPreviewSourceAnchorIndexing() {
     state.previewIndexGeneration++;
+    clearTimeout(state.previewIndexStartTimer);
+    state.previewIndexStartTimer = null;
     if (state.previewIndexHandle != null) {
       if (typeof cancelIdleCallback === 'function') cancelIdleCallback(state.previewIndexHandle);
       else clearTimeout(state.previewIndexHandle);
@@ -2478,6 +2954,7 @@
       if (generation !== state.previewIndexGeneration) return;
 
       let processed = 0;
+      const started = performance.now();
       while (index < elements.length) {
         const element = elements[index++];
         let mapping = null;
@@ -2507,14 +2984,20 @@
         }
 
         processed++;
-        if (processed >= 12 && !deadline.didTimeout && deadline.timeRemaining() < 4) break;
-        if (processed >= 40) break;
+        // A timed-out idle callback still needs a wall-clock budget; scanning
+        // a long source document forty times can otherwise block the editor.
+        if (performance.now() - started >= 4 || deadline.timeRemaining() < 2 || processed >= 8) break;
       }
 
       if (index < elements.length && generation === state.previewIndexGeneration) schedule(work);
     };
 
-    if (elements.length) schedule(work);
+    // Source links have an on-demand fallback. Build the full index only after
+    // the preview has settled rather than competing with continuous typing.
+    if (elements.length) state.previewIndexStartTimer = setTimeout(() => {
+      state.previewIndexStartTimer = null;
+      if (generation === state.previewIndexGeneration) schedule(work);
+    }, 250);
   }
 
   function distanceToSourceRange(offset, anchor) {
