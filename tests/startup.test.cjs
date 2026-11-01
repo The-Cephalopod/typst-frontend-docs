@@ -37,6 +37,7 @@ function harness() {
     compilePreviewOnce, compilePreview, showCompileError, handleFatalRepoError,
     hooks(h) {
       if (h.initMonaco) initMonaco = h.initMonaco;
+      if (h.createWorkerTypstRuntime) createWorkerTypstRuntime = h.createWorkerTypstRuntime;
       if (h.loadScript) loadScript = h.loadScript;
       if (h.ensureMonaco) ensureMonaco = h.ensureMonaco;
       if (h.ensureTypstRuntime) ensureTypstRuntime = h.ensureTypstRuntime;
@@ -68,7 +69,7 @@ function harness() {
     TextEncoder, TextDecoder, Uint8Array, Map, Set, WeakMap, URLSearchParams,
     atob: value => Buffer.from(value, 'base64').toString('binary'),
     setTimeout, clearTimeout, cancelAnimationFrame: noop,
-    window, document, location, console,
+    window, document, location, console, Worker: function Worker() {},
   });
   vm.runInContext(source, context, { filename: appPath });
   const app = context.appTest;
@@ -116,7 +117,7 @@ async function runtimeStartupSharesAndRetries() {
   const { app, window } = harness();
   let calls = 0;
   const first = deferred();
-  app.hooks({ loadScript: () => { calls++; return first.promise; } });
+  app.hooks({ createWorkerTypstRuntime: () => { calls++; return first.promise; } });
   const a = app.ensureTypstRuntime();
   const b = app.ensureTypstRuntime();
   assert.equal(a, b);
@@ -124,21 +125,14 @@ async function runtimeStartupSharesAndRetries() {
   first.reject(new Error('Controlled failure'));
   await rejection;
   assert.equal(app.state.runtimeInitPromise, null);
-  const configured = [];
-  app.hooks({ loadScript: async (url, type) => {
+  app.hooks({ createWorkerTypstRuntime: async () => {
     calls++;
-    assert.equal(type, 'module');
-    assert(url.includes('@0.8.0-rc3/'), 'Runtime must retain version pin.');
-    window.$typst = {
-      setCompilerInitOptions: options => configured.push(options.getModule()),
-      setRendererInitOptions: options => configured.push(options.getModule()),
-    };
+    return { isWorkerRuntime: true };
   } });
   await app.ensureTypstRuntime();
   await app.ensureTypstRuntime();
   assert.equal(calls, 2);
-  assert.equal(configured.length, 2);
-  assert(configured.every(url => url.startsWith('https://cdn.jsdelivr.net/') && url.includes('@0.8.0-rc3/')));
+  assert.equal(window.$typst.isWorkerRuntime, true);
   assert.equal(app.state.compilerReady, true);
 }
 

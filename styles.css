@@ -542,3 +542,14 @@ button, a { -webkit-tap-highlight-color: transparent; }
   rx: 4px;
   ry: 4px;
 }
+
+/* Only pages near the viewport contain glyph DOM. Each placeholder retains
+   exact page geometry, so scrolling and zooming do not move the document. */
+.preview-page-card {
+  flex: 0 0 auto;
+  contain: layout style paint;
+  background: white;
+  border-radius: 4px;
+  box-shadow: 0 6px 26px rgba(0,0,0,.28);
+}
+.preview-page-card > svg { filter: none; }

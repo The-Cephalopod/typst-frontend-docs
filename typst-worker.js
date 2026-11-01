@@ -48,6 +48,14 @@ function compileOptions(args, format = 0) {
   };
 }
 
+function compileDocument(compiler, args, format = 0) {
+  const options = compileOptions(args, format);
+  // The pinned compiler.compile() creates a WASM world without explicitly
+  // freeing it. Scope each snapshot so a long editing session doesn't retain
+  // old documents until the garbage collector happens to finalize them.
+  return compiler.runWithWorld(options, world => format === 1 ? world.pdf(options) : world.vector(options));
+}
+
 // Split the pinned renderer's SVG without constructing a DOM in the worker.
 // Unexpected structure returns null so callers can retain full-SVG rendering.
 function splitSvgPages(svg) {
@@ -201,7 +209,7 @@ const methods = {
   },
   async compile(args) {
     const { compiler } = await getEngine();
-    const result = await compiler.compile(compileOptions(args));
+    const result = await compileDocument(compiler, args);
     return { result: result?.result, diagnostics: cloneDiagnostics(result?.diagnostics) };
   },
   async svg(args) {
@@ -211,7 +219,7 @@ const methods = {
   },
   async compilePreview(args) {
     const { compiler, runtime } = await getEngine();
-    const result = await compiler.compile(compileOptions(args));
+    const result = await compileDocument(compiler, args);
     const diagnostics = cloneDiagnostics(result?.diagnostics);
     // Keep the potentially large vector artifact inside this worker.
     const svg = result?.result ? await runtime.svg({ vectorData: result.result }) : null;
@@ -221,7 +229,7 @@ const methods = {
     const { compiler } = await getEngine();
     // The convenience pdf wrapper resets compiler caches; native format 1
     // exports the same document while retaining the current compilation state.
-    const result = await compiler.compile(compileOptions(args, 1));
+    const result = await compileDocument(compiler, args, 1);
     if (!(result?.result instanceof Uint8Array)) {
       const error = new Error('Typst could not export the PDF.');
       error.diagnostics = cloneDiagnostics(result?.diagnostics);

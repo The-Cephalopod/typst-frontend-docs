@@ -65,7 +65,6 @@
     editor: null,
     editorInitPromise: null,
     runtimeInitPromise: null,
-    workerDisabled: false,
     repositoryLoadSerial: 0,
     editorModel: null,
     suppressEditorChange: false,
@@ -83,6 +82,8 @@
     previewZoom: 1,
     previewFit: false,
     previewSvgCache: null,
+    previewPageObserver: null,
+    previewMountTimer: null,
     promptResolver: null,
     activeModal: null,
     diagnostics: [],
@@ -735,9 +736,8 @@
       for (const task of pending.values()) task.reject(error);
       pending.clear();
       if (ready && window.$typst === service) {
-        // Recover through the compatibility runtime if a worker is unavailable.
+        // Never move WebAssembly onto the input thread after a worker failure.
         window.$typst = null;
-        state.workerDisabled = true;
         state.runtimeInitPromise = null;
         state.compilerReady = false;
         state.compilerHydrated = false;
@@ -801,6 +801,7 @@
       return result;
     };
     service = {
+      isWorkerRuntime: true,
       getCompiler: async () => compiler,
       resetShadow: async () => { const result = await request('resetShadow'); previewParts = null; return result; },
       mapShadow: (path, bytes) => request('mapShadow', { path, bytes }),
@@ -821,29 +822,8 @@
   function ensureTypstRuntime() {
     if (!state.runtimeInitPromise) {
       state.runtimeInitPromise = (async () => {
-        if (!window.$typst && !state.workerDisabled && typeof Worker === 'function') {
-          try {
-            window.$typst = await createWorkerTypstRuntime();
-            state.compilerReady = true;
-            return;
-          } catch (error) {
-            state.workerDisabled = true;
-            console.warn('Background Typst initialization failed; using the browser runtime.', error);
-          }
-        }
-        if (!window.$typst) await loadScript('https://cdn.jsdelivr.net/npm/@myriaddreamin/typst.ts@0.8.0-rc3/dist/esm/contrib/all-in-one-lite.bundle.js', 'module');
-        if (!window.$typst) throw new Error('Typst runtime did not initialize.');
-        window.$typst.setCompilerInitOptions({
-          getModule: () => 'https://cdn.jsdelivr.net/npm/@myriaddreamin/typst-ts-web-compiler@0.8.0-rc3/pkg/typst_ts_web_compiler_bg.wasm',
-        });
-        window.$typst.setRendererInitOptions({
-          getModule: () => 'https://cdn.jsdelivr.net/npm/@myriaddreamin/typst-ts-renderer@0.8.0-rc3/pkg/typst_ts_renderer_bg.wasm',
-        });
-        // Pay initialization cost while the repository opens, before typing.
-        await Promise.all([
-          window.$typst.getCompiler?.(),
-          window.$typst.getRenderer?.(),
-        ]);
+        if (typeof Worker !== 'function') throw new Error('Live preview requires Web Workers. Open this site in a current browser over HTTP or HTTPS. Your editor remains available.');
+        if (!window.$typst?.isWorkerRuntime) window.$typst = await createWorkerTypstRuntime();
         state.compilerReady = true;
       })().catch(err => {
         state.runtimeInitPromise = null;
@@ -993,6 +973,7 @@
     clearTimeout(state.fileTreeRenderTimer);
     clearTimeout(state.editorSyncTimer);
     cancelPreviewSourceAnchorIndexing();
+    disposePreviewPages();
     state.repo = null; state.branch = null; state.branches = []; state.headSha = null; state.baseTreeSha = null;
     state.rawTree = []; state.fileIndex = new Map(); state.fileBytes = new Map(); state.fileRequests = new Map(); state.originalBytes = new Map(); state.sourceTextCache = new Map(); state.changes = new Map();
     state.pathsCache = null; state.typPathsCache = null; state.treeCache = null; state.fileTreeRows = new Map(); state.fileTreeRenderTimer = null;
@@ -1381,9 +1362,10 @@
     state.editorSyncPath = path;
     if (!state.changes.has(path)) {
       state.changes.set(path, { type: meta?.existing ? 'modify' : 'add', pending: true });
+      // Dirty-state DOM only changes on the first edit, not on every keystroke.
+      updateChangeUI();
+      updateFileTreeDirtyIndicator(path, true);
     }
-    updateChangeUI();
-    updateFileTreeDirtyIndicator(path, true);
 
     clearTimeout(state.editorSyncTimer);
     state.editorSyncTimer = setTimeout(() => {
@@ -1394,6 +1376,7 @@
     // Publish completed snapshots while typing, then compile the newest edit.
     // Cancelling every in-flight result would starve a long document's preview.
     state.editRevision++;
+    releasePreviewNavigationPage();
     cancelPreviewSourceAnchorIndexing();
     state.previewSourceAnchors = [];
     state.previewAnchorMap = new WeakMap();
@@ -1673,7 +1656,7 @@
 
   function waitForTypstRuntime() { return ensureTypstRuntime(); }
 
-  function scheduleCompile(delay = 40) {
+  function scheduleCompile(delay = 16) {
     if (!state.mainPath || els['editor-view'].classList.contains('hidden')) return;
     if (state.compileInFlight) {
       state.compileQueued = true;
@@ -2081,6 +2064,82 @@
     try { return JSON.stringify(err, null, 2); } catch { return String(err); }
   }
 
+  function disposePreviewPages() {
+    state.previewPageObserver?.disconnect();
+    state.previewPageObserver = null;
+    clearTimeout(state.previewMountTimer);
+    state.previewMountTimer = null;
+  }
+
+  function releasePreviewNavigationPage() {
+    const cache = state.previewSvgCache;
+    const page = cache?.pinnedPage;
+    if (!page) return;
+    page.navigationPinned = false;
+    cache.pinnedPage = null;
+    if (!page.visible) {
+      page.svg.replaceChildren();
+      page.group = null;
+      page.mountedRaw = null;
+    }
+  }
+
+  function observePreviewPages(cache) {
+    if (!state.previewPageObserver) {
+      state.previewPageObserver = new IntersectionObserver(entries => {
+        if (cache !== state.previewSvgCache) return;
+        for (const entry of entries) {
+          const page = cache.pages[Number(entry.target.dataset.pageNumber) - 1];
+          if (!page || page.node !== entry.target) continue;
+          page.visible = entry.isIntersecting;
+          if (page.visible && page.navigationPinned) {
+            page.navigationPinned = false;
+            cache.pinnedPage = null;
+          }
+          if (!page.visible && page.group && !page.navigationPinned) {
+            page.svg.replaceChildren();
+            page.group = null;
+            page.mountedRaw = null;
+          }
+        }
+        schedulePreviewPageMounts();
+      }, { root: els['preview-scroll'], rootMargin: '160px 0px' });
+    }
+    for (const page of cache.pages) {
+      if (page.observed) continue;
+      state.previewPageObserver.observe(page.node);
+      page.observed = true;
+    }
+  }
+
+  function mountPreviewPage(page) {
+    if (page.mountedRaw === page.raw) return;
+    const holder = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    holder.innerHTML = page.raw;
+    const group = holder.firstElementChild;
+    if (!group?.classList.contains('typst-page')) return;
+    group.removeAttribute('transform');
+    page.svg.replaceChildren(group);
+    page.group = group;
+    page.mountedRaw = page.raw;
+  }
+
+  function schedulePreviewPageMounts() {
+    if (state.previewMountTimer != null) return;
+    // One visible page per task; the browser can process input and paint the
+    // editor between pages. Off-screen pages remain lightweight placeholders.
+    state.previewMountTimer = setTimeout(() => {
+      state.previewMountTimer = null;
+      const cache = state.previewSvgCache;
+      if (cache?.mode !== 'cards') return;
+      const page = cache.pages.find(page => page.visible && page.raw !== page.mountedRaw);
+      if (!page) return;
+      mountPreviewPage(page);
+      if (cache.pages.some(page => page.visible && page.raw !== page.mountedRaw)) schedulePreviewPageMounts();
+      else schedulePreviewSourceAnchorIndexing();
+    }, 0);
+  }
+
   function installPreviewSvg(svg, parts) {
     const output = els['preview-output'];
     const validParts = parts && ['opening', 'prefix', 'suffix', 'closing'].every(key => typeof parts[key] === 'string') &&
@@ -2132,96 +2191,76 @@
     };
     const installCards = () => {
       let cache = state.previewSvgCache;
-      const reusable = cache?.mode === 'cards' && cache.root.parentNode === output &&
-        cache.pages.every(page => page.node.parentNode === output);
+      const reusable = cache?.mode === 'cards' && cache.root.parentNode === output;
       const holder = document.createElement('div');
-      holder.innerHTML = reusable ? parts.opening + parts.closing : completeSvg();
+      // Read only the root and page headers here. Parsing every glyph on every
+      // page creates hundreds of thousands of DOM nodes before the first paint.
+      holder.innerHTML = parts.opening + parts.closing;
       const template = holder.firstElementChild;
       if (template?.localName !== 'svg' || holder.children.length !== 1) return false;
-      const initialGroups = reusable ? [] : Array.from(template.querySelectorAll(':scope > g.typst-page'));
-      if (!reusable && initialGroups.length !== parts.pages.length) return false;
-      const changed = new Map();
+      const dimensions = [];
       for (let index = 0; index < parts.pages.length; index++) {
-        if (reusable && cache.pages[index]?.raw === parts.pages[index]) continue;
-        const group = reusable ? parseNodes(parts.pages[index]).find(node => node.nodeType === 1) : initialGroups[index];
+        const previous = reusable && cache.pages[index];
+        if (previous?.raw === parts.pages[index]) { dimensions.push(previous); continue; }
+        const header = /^<g\b(?:[^>"']|"[^"]*"|'[^']*')*>/.exec(parts.pages[index]);
+        const group = header && parseNodes(header[0] + (header[0].endsWith('/>') ? '' : '</g>'))[0];
         const width = parseFloat(group?.getAttribute('data-page-width'));
         const height = parseFloat(group?.getAttribute('data-page-height'));
-        if (group?.localName !== 'g' || !group.classList.contains('typst-page') || !(width > 0 && height > 0)) return false;
-        changed.set(index, { group, width, height });
+        if (!group?.classList.contains('typst-page') || !(width > 0 && height > 0)) return false;
+        dimensions.push({ width, height });
       }
       const pageTemplate = template.cloneNode(false);
       pageTemplate.removeAttribute('id');
       pageTemplate.classList.add('typst-doc', 'preview-page-surface');
       Object.assign(pageTemplate.style, {
         display: 'block', background: 'transparent', border: '0', boxShadow: 'none',
-        borderRadius: '0', overflow: 'visible', filter: 'none',
+        borderRadius: '0', overflow: 'hidden', filter: 'none',
       });
       if (!reusable) {
-        const children = Array.from(template.childNodes);
+        disposePreviewPages();
         cache = {
-          mode: 'cards', root: template, opening: parts.opening, prefix: parts.prefix, suffix: parts.suffix,
-          prefixNodes: children.slice(0, children.indexOf(initialGroups[0])),
-          suffixNodes: children.slice(children.indexOf(initialGroups[initialGroups.length - 1]) + 1),
-          pages: [], previousGap: state.previewSvgCache?.mode === 'cards' ? state.previewSvgCache.previousGap : output.style.gap,
+          mode: 'cards', root: template, pages: [], prefixNodes: [], suffixNodes: [],
+          previousGap: state.previewSvgCache?.mode === 'cards' ? state.previewSvgCache.previousGap : output.style.gap,
         };
       }
       const root = cache.root;
       if (reusable && cache.opening !== parts.opening) applyAttributes(root, template);
-      const rootStyles = {
+      Object.assign(root.style, {
         position: 'absolute', width: '0px', height: '0px', overflow: 'hidden',
         background: 'transparent', border: '0', boxShadow: 'none', pointerEvents: 'none',
-      };
-      for (const [name, value] of Object.entries(rootStyles)) if (root.style[name] !== value) root.style[name] = value;
+      });
       setAttribute(root, 'width', 0); setAttribute(root, 'height', 0);
       setAttribute(root, 'aria-hidden', 'true');
       for (let index = 0; index < parts.pages.length; index++) {
-        const update = changed.get(index);
         let record = cache.pages[index];
         if (!record) {
           const node = document.createElement('div');
           node.className = 'preview-page-card';
-          Object.assign(node.style, { contain: 'layout style', flex: '0 0 auto', filter: 'drop-shadow(0 6px 13px rgba(0,0,0,.28))' });
           const pageSvg = pageTemplate.cloneNode(false);
-          const background = document.createElementNS(SVG_NS, 'rect');
-          background.classList.add('preview-page-background');
-          setAttribute(background, 'x', 0); setAttribute(background, 'y', 0);
-          setAttribute(background, 'fill', '#ffffff'); setAttribute(background, 'pointer-events', 'none');
-          pageSvg.appendChild(background); node.appendChild(pageSvg);
-          record = { raw: null, node, svg: pageSvg, background, group: null };
+          node.appendChild(pageSvg);
+          record = { node, svg: pageSvg, group: null, mountedRaw: null, visible: false };
           cache.pages[index] = record;
+          if (reusable) output.appendChild(node);
         }
-        if (update) {
-          if (update.group.hasAttribute('transform')) update.group.removeAttribute('transform');
-          if (record.group) record.group.replaceWith(update.group);
-          else record.svg.appendChild(update.group);
-          Object.assign(record, update, { raw: parts.pages[index] });
-        }
-        if (!reusable || cache.opening !== parts.opening) {
-          setAttribute(pageTemplate, 'width', record.width); setAttribute(pageTemplate, 'height', record.height);
-          setAttribute(pageTemplate, 'viewBox', `0 0 ${record.width} ${record.height}`);
-          pageTemplate.style.width = `${record.width}px`; pageTemplate.style.height = `${record.height}px`;
-          applyAttributes(record.svg, pageTemplate);
-        }
-        for (const [name, value] of Object.entries({ width: `${record.width}px`, height: `${record.height}px`, containIntrinsicSize: `${record.width}px ${record.height}px` })) {
+        Object.assign(record, dimensions[index], { raw: parts.pages[index] });
+        if (!reusable || cache.opening !== parts.opening) applyAttributes(record.svg, pageTemplate);
+        for (const [name, value] of Object.entries({ width: record.width + 'px', height: record.height + 'px' })) {
           if (record.node.style[name] !== value) record.node.style[name] = value;
         }
         setAttribute(record.node, 'data-page-number', index + 1);
         setAttribute(record.svg, 'width', record.width); setAttribute(record.svg, 'height', record.height);
-        setAttribute(record.svg, 'viewBox', `0 0 ${record.width} ${record.height}`);
+        setAttribute(record.svg, 'viewBox', '0 0 ' + record.width + ' ' + record.height);
         setAttribute(record.svg, 'data-page-number', index + 1);
-        if (record.svg.style.width !== `${record.width}px`) record.svg.style.width = `${record.width}px`;
-        if (record.svg.style.height !== `${record.height}px`) record.svg.style.height = `${record.height}px`;
-        setAttribute(record.background, 'width', record.width); setAttribute(record.background, 'height', record.height);
-        if (reusable && record.node.parentNode !== output) output.appendChild(record.node);
       }
-      for (const record of cache.pages.slice(parts.pages.length)) record.node.remove();
+      for (const record of cache.pages.slice(parts.pages.length)) {
+        state.previewPageObserver?.unobserve(record.node);
+        record.node.remove();
+      }
       cache.pages.length = parts.pages.length;
-      if (reusable && cache.prefix !== parts.prefix) {
-        cache.prefixNodes = patchNodes(root, cache.prefixNodes, parseNodes(parts.prefix), cache.suffixNodes.find(node => node.parentNode === root) || null);
+      if (cache.prefix !== parts.prefix) {
+        cache.prefixNodes = patchNodes(root, cache.prefixNodes, parseNodes(parts.prefix), cache.suffixNodes[0] || null);
       }
-      if (reusable && cache.suffix !== parts.suffix) {
-        cache.suffixNodes = patchNodes(root, cache.suffixNodes, parseNodes(parts.suffix));
-      }
+      if (cache.suffix !== parts.suffix) cache.suffixNodes = patchNodes(root, cache.suffixNodes, parseNodes(parts.suffix));
       if (!reusable) output.replaceChildren(root, ...cache.pages.map(page => page.node));
       if (output.style.gap !== '16px') output.style.gap = '16px';
       cache.opening = parts.opening; cache.prefix = parts.prefix; cache.suffix = parts.suffix;
@@ -2229,10 +2268,13 @@
       cache.height = cache.pages.reduce((sum, page) => sum + page.height, 0) + 16 * (cache.pages.length - 1);
       setAttribute(root, 'data-base-width', cache.width); setAttribute(root, 'data-base-height', cache.height);
       state.previewSvgCache = cache;
+      observePreviewPages(cache);
+      schedulePreviewPageMounts();
       return true;
     };
-    if (validParts && parts.pages.length > 8 && installCards()) return;
+    if (validParts && typeof IntersectionObserver === 'function' && installCards()) return;
     const replaceAll = () => {
+      disposePreviewPages();
       if (state.previewSvgCache?.mode === 'cards') output.style.gap = state.previewSvgCache.previousGap;
       output.innerHTML = completeSvg();
       state.previewSvgCache = null;
@@ -2323,7 +2365,8 @@
   function normalizePreviewSvg() {
     const output = els['preview-output'];
     if (state.previewSvgCache?.mode === 'cards' && state.previewSvgCache.root.parentNode === output) {
-      const label = `${state.previewSvgCache.pages.length} pages`;
+      const count = state.previewSvgCache.pages.length;
+      const label = count === 1 ? '1 page' : `${count} pages`;
       if (els['preview-page-label'].textContent !== label) els['preview-page-label'].textContent = label;
       return;
     }
@@ -3047,8 +3090,78 @@
     const model = state.editor.getModel();
     if (!model) return;
     const offset = model.getOffsetAt(event.target.position);
+    if (state.previewSvgCache?.mode === 'cards') {
+      revealVirtualPreviewSource(state.openPath, offset).catch(console.error);
+      return;
+    }
     const anchor = previewAnchorForSourcePosition(state.openPath, offset);
     if (anchor) scrollPreviewToAnchor(anchor);
+  }
+
+  async function revealVirtualPreviewSource(path, offset) {
+    const cache = state.previewSvgCache;
+    releasePreviewNavigationPage();
+    const revision = state.editRevision;
+    const request = (cache.navigationRequest || 0) + 1;
+    cache.navigationRequest = request;
+    const current = () => cache === state.previewSvgCache && revision === state.editRevision && cache.navigationRequest === request;
+    const source = sourceText(path);
+    const probesByText = new Map();
+    let lastOffset = 0;
+    let best = null;
+    // Source-to-preview navigation may target an unmounted page. Scan detached
+    // pages only when requested, yield between small batches, and stop as soon
+    // as typing resumes. Nothing here runs on the keystroke/compile path.
+    for (let pageIndex = 0; pageIndex < cache.pages.length && current(); pageIndex++) {
+      await new Promise(resolve => setTimeout(resolve, 0));
+      if (!current()) return;
+      const page = cache.pages[pageIndex];
+      const holder = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      holder.innerHTML = page.raw;
+      const elements = holder.querySelectorAll('.typst-text, image');
+      let started = performance.now();
+      for (let index = 0; index < elements.length; index++) {
+        const element = elements[index];
+        let mapping;
+        if (element.localName === 'image') mapping = findAssetReferenceSource(imagePathFromRenderedElement(element));
+        else {
+          const text = renderedAnchorText(element);
+          let probes = probesByText.get(text);
+          if (!probes) {
+            probes = textSearchProbes(text);
+            probesByText.set(text, probes);
+          }
+          // Search forward in the requested file instead of constructing all
+          // matches across every file for every rendered line.
+          for (const probe of probes) {
+            let found = source.indexOf(probe, lastOffset);
+            if (found < 0) found = source.indexOf(probe);
+            if (found < 0) continue;
+            mapping = { path, offset: found, length: probe.length };
+            lastOffset = found + probe.length;
+            break;
+          }
+        }
+        if (mapping?.path === path) {
+          const distance = distanceToSourceRange(offset, mapping);
+          if (!best || distance < best.distance) best = { page, index, distance };
+          if (distance === 0) break;
+        }
+        if (performance.now() - started >= 4) {
+          await new Promise(resolve => setTimeout(resolve, 0));
+          if (!current()) return;
+          started = performance.now();
+        }
+      }
+      if (best?.distance === 0) break;
+    }
+    if (!current() || !best || best.distance > 320) return;
+    // Mount before scrolling so the normal highlighting and click path works.
+    best.page.navigationPinned = true;
+    cache.pinnedPage = best.page;
+    mountPreviewPage(best.page);
+    const element = best.page.svg.querySelectorAll('.typst-text, image')[best.index];
+    scrollPreviewToAnchor({ element });
   }
 
   async function openFileAtOffset(path, offset, length = 0) {

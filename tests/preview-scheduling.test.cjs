@@ -111,21 +111,43 @@ function harness() {
   };
 }
 
-async function continuousInputKeepsFirstFortyMillisecondDeadline() {
+async function continuousInputKeepsFirstFrameDeadline() {
   const h = harness(), calls = [];
   h.app.hooks({ compilePreview: async () => calls.push(h.now()) });
   const serial = h.app.state.compileSerial;
   h.app.onEditorChanged({});
   const timer = h.app.state.compileTimer;
-  for (let i = 0; i < 3; i++) { await h.advance(10); h.app.onEditorChanged({}); }
+  for (let i = 0; i < 3; i++) { await h.advance(4); h.app.onEditorChanged({}); }
   assert.equal(h.app.state.compileTimer, timer, 'Repeated edits must keep the first preview deadline.');
-  assert.equal(h.app.state.compileDueAt, 40);
+  assert.equal(h.app.state.compileDueAt, 16);
   assert.equal(h.app.state.compileSerial, serial, 'Typing must not invalidate a running snapshot.');
   assert.equal(h.app.state.editRevision, 4);
-  await h.advance(9);
+  await h.advance(3);
   assert.equal(calls.length, 0);
   await h.advance(1);
-  assert.deepEqual(calls, [40], 'Continuous input must still produce a preview after the first 40 ms.');
+  assert.deepEqual(calls, [16], 'Continuous input must still produce a preview after the first 16 ms.');
+}
+
+async function keystrokesNeverReadOrCompileTheWholeDocument() {
+  const h = harness();
+  h.app.state.editor.getValue = () => { throw new Error('A keystroke must not serialize the editor'); };
+  h.window.$typst = { mapShadow: () => { throw new Error('A keystroke must not call the compiler'); } };
+  h.app.hooks({ syncOpenFileFromEditor: () => { throw new Error('Sync must be deferred'); } });
+  for (let i = 0; i < 200; i++) h.app.onEditorChanged({});
+  assert.equal(h.app.state.editRevision, 200);
+  assert.equal(h.app.state.changes.size, 1);
+  assert.equal(h.timers.size, 2, 'Typing must retain only one preview timer and one sync timer.');
+  assert.equal(h.app.state.compileDueAt, 16);
+}
+
+async function unavailableWorkersNeverLoadTheCompilerOnTheInputThread() {
+  const h = harness();
+  h.context.Worker = undefined;
+  h.app.hooks({ loadScript: () => { throw new Error('UI compiler fallback must never run'); } });
+  await assert.rejects(h.app.ensureTypstRuntime(), /requires Web Workers/);
+  assert.equal(h.app.state.compilerReady, false);
+  h.app.onEditorChanged({});
+  assert.equal(h.app.state.editorSyncPending, true);
 }
 
 async function queuedCompilesCoalesceToTheLatestRevisionWithoutOverlap() {
@@ -173,7 +195,7 @@ async function dataEditsAlsoRequestAPreview() {
   h.app.state.openPath = 'data.json';
   h.app.state.fileIndex.set('data.json', { existing: true });
   h.app.onEditorChanged({});
-  assert.equal(h.app.state.compileDueAt, 40, 'JSON/data edits can affect the main document and must schedule compilation.');
+  assert.equal(h.app.state.compileDueAt, 16, 'JSON/data edits can affect the main document and must schedule compilation.');
   assert.equal(h.app.state.editorSyncPath, 'data.json');
 }
 
@@ -251,7 +273,6 @@ async function workerClientClonesBuffersAndCleansUpErrors() {
   await Promise.all([rejectedA, rejectedB]);
   assert.equal(worker.terminated, true);
   assert.equal(h.window.$typst, null);
-  assert.equal(h.app.state.workerDisabled, true);
   assert.equal(h.app.state.runtimeInitPromise, null);
   assert.equal(h.app.state.compilerReady, false);
   assert.equal(h.app.state.compilerHydrated, false);
@@ -260,25 +281,24 @@ async function workerClientClonesBuffersAndCleansUpErrors() {
   assert.equal(worker.posts.length, posts, 'A stopped worker must not accumulate pending requests.');
 }
 
-async function failedWorkerInitializationFallsBackAndWarmsBothModules() {
-  const h = harness(), configured = [], warmed = [];
-  const runtime = {
-    setCompilerInitOptions: options => configured.push(options.getModule()),
-    setRendererInitOptions: options => configured.push(options.getModule()),
-    getCompiler: async () => warmed.push('compiler'), getRenderer: async () => warmed.push('renderer'),
-  };
-  h.app.hooks({ loadScript: async () => { h.window.$typst = runtime; } });
+async function failedWorkerInitializationNeverBlocksTheEditorAndCanRetry() {
+  const h = harness();
+  h.app.hooks({ loadScript: async () => { throw new Error('Must not load a UI-thread compiler'); } });
   const ready = h.app.ensureTypstRuntime();
   const worker = h.workers[0];
+  const rejected = assert.rejects(ready, /Controlled init failure/);
   worker.respond('init', undefined, { name: 'Error', message: 'Controlled init failure' });
-  await ready;
+  await rejected;
   assert.equal(worker.terminated, true);
-  assert.equal(h.app.state.workerDisabled, true);
-  assert.equal(h.window.$typst, runtime);
+  assert.equal(h.window.$typst, undefined);
+  assert.equal(h.app.state.runtimeInitPromise, null);
+  h.app.onEditorChanged({});
+  assert.equal(h.app.state.editorSyncPending, true, 'Editing remains available after a worker failure.');
+  const retry = h.app.ensureTypstRuntime();
+  h.workers[1].respond('init', {});
+  await retry;
+  assert.equal(h.window.$typst.isWorkerRuntime, true);
   assert.equal(h.app.state.compilerReady, true);
-  assert.equal(configured.length, 2);
-  assert(configured.every(url => url.includes('@0.8.0-rc3/')));
-  assert.deepEqual(warmed.sort(), ['compiler', 'renderer']);
 }
 
 async function failedCompileStillProcessesNewerQueuedEdit() {
@@ -347,11 +367,12 @@ async function workerPageDeltasUseReceivedSnapshotsAndRecoverAfterReset() {
 }
 
 (async () => {
-  const tests = [continuousInputKeepsFirstFortyMillisecondDeadline,
+  const tests = [continuousInputKeepsFirstFrameDeadline, keystrokesNeverReadOrCompileTheWholeDocument,
+    unavailableWorkersNeverLoadTheCompilerOnTheInputThread,
     queuedCompilesCoalesceToTheLatestRevisionWithoutOverlap, completedValidSnapshotsPublishWhileTypingContinues,
     dataEditsAlsoRequestAPreview, changedMainFileAndRouteCannotPublishOldOutput,
     latestInvalidSyntaxKeepsTheLastGoodPreviewAndShowsDiagnostics, supersededSyntaxErrorsDoNotReplaceLatestDiagnostics,
-    workerClientClonesBuffersAndCleansUpErrors, failedWorkerInitializationFallsBackAndWarmsBothModules,
+    workerClientClonesBuffersAndCleansUpErrors, failedWorkerInitializationNeverBlocksTheEditorAndCanRetry,
     failedCompileStillProcessesNewerQueuedEdit, persistentFailureOfOneRevisionDoesNotLoop, workerPageDeltasUseReceivedSnapshotsAndRecoverAfterReset];
   for (const test of tests) { await test(); console.log(`PASS ${test.name}`); }
   console.log(`${tests.length} preview scheduling/client checks passed. Timers, browser elements and worker transport are controlled VM doubles.`);
