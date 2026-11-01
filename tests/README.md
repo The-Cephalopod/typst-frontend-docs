@@ -18,11 +18,14 @@ The VM checks do not execute CDN libraries, WebAssembly or browser rendering. Th
 npm install --no-save playwright
 npx playwright install chromium
 node tests/browser-performance.cjs
+node tests/browser-interactions.cjs
 ```
 
 Alternatively set `BROWSER_CHANNEL=msedge` to use an installed Microsoft Edge. The app itself remains dependency-free and needs no build step. Playwright is only a test dependency. The test serves the source on a temporary localhost port and uses a fresh headless browser with the real pinned Monaco/Typst CDN modules and fonts. It does not connect to a GitHub account or modify any repository.
 
 The fixture is approximately 413 KB of Typst source producing 90 pages. The test records 40 typing samples and eight isolated-edit preview samples, then checks viewport mounting, unchanged-page reuse, scrolling, zoom, navigation in both directions, PDF export, syntax recovery, changing page counts and project reset.
+
+`browser-interactions.cjs` binds the application's real event handlers and clicks rendered text in a project with an included file. It checks that line 183 remains visible after deferred layout, repeated preview clicks preserve undo history, a real mouse click closes Find while its Escape tooltip is present, keyboard Escape still closes Find, and tooltips containing documentation links remain interactive. This catches viewport and hit-testing bugs that checking the selected text alone cannot detect.
 
 Optional environment variables:
 

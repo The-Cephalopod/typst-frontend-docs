@@ -553,3 +553,11 @@ button, a { -webkit-tap-highlight-color: transparent; }
   box-shadow: 0 6px 26px rgba(0,0,0,.28);
 }
 .preview-page-card > svg { filter: none; }
+
+/* Monaco's plain toolbar tooltip can overlap its own control (notably the
+   Find close button). Let clicks reach that control through the tooltip.
+   Documentation/diagnostic popups with links or controls stay interactive. */
+#editor-container > .context-view:has(.monaco-hover.compact):not(:has(a, button, input, select, textarea, [role="button"], [role="link"])),
+#editor-container > .context-view:has(.monaco-hover.compact):not(:has(a, button, input, select, textarea, [role="button"], [role="link"])) * {
+  pointer-events: none !important;
+}

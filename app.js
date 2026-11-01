@@ -395,13 +395,15 @@
   }
 
   function settleEditorLayout(resetScroll = false) {
+    // A later preview/diagnostic jump must win over opening a file. Reset now,
+    // before callers select/reveal their target, never in a queued frame.
+    if (resetScroll && state.editor) {
+      state.editor.setScrollTop(0);
+      state.editor.setScrollLeft(0);
+    }
     scheduleEditorLayout();
     requestAnimationFrame(() => {
       scheduleEditorLayout();
-      if (resetScroll && state.editor) {
-        state.editor.setScrollTop(0);
-        state.editor.setScrollLeft(0);
-      }
     });
   }
 
@@ -3083,6 +3085,8 @@
 
   function handleEditorPreviewClick(event) {
     if (!state.openPath || !isTextPath(state.openPath) || !event?.target?.position) return;
+    // Find/replace controls and other overlay widgets are not source clicks.
+    if (event.target.type !== state.monaco.editor.MouseTargetType.CONTENT_TEXT) return;
     const browserEvent = event.event?.browserEvent;
     if (browserEvent && Number.isFinite(browserEvent.button) && browserEvent.button !== 0) return;
     const selection = state.editor.getSelection();
@@ -3165,8 +3169,14 @@
   }
 
   async function openFileAtOffset(path, offset, length = 0) {
-    if (!path || !state.fileIndex.has(path)) return false;
-    await openFile(path);
+    if (!path || !state.fileIndex.has(path) || state.deletedPaths.has(path)) return false;
+    const repositorySerial = state.repositoryLoadSerial;
+    // Replacing the current model erases undo history and resets its viewport.
+    // A jump within the open file needs only a new selection and scroll target.
+    if (state.openPath !== path || !state.editor?.getModel() || els['editor-container'].classList.contains('hidden')) {
+      await openFile(path);
+    }
+    if (repositorySerial !== state.repositoryLoadSerial || state.openPath !== path) return false;
     if (!isTextPath(path)) return true;
     const model = state.editor.getModel();
     const max = model.getValueLength();
@@ -3176,7 +3186,7 @@
     const endPos = model.getPositionAt(end);
     const selection = new state.monaco.Range(startPos.lineNumber, startPos.column, endPos.lineNumber, endPos.column);
     state.editor.setSelection(selection);
-    state.editor.revealRangeInCenter(selection, state.monaco.editor.ScrollType.Smooth);
+    state.editor.revealRangeInCenter(selection, state.monaco.editor.ScrollType.Immediate);
     state.editor.focus();
     state.previewLastJump = { path, offset: start };
     return true;
