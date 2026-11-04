@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="color-scheme" content="dark" />
+  <meta name="color-scheme" content="dark light" />
   <meta name="theme-color" content="#151618" />
   <title>Typst Git Editor</title>
   <link rel="preconnect" href="https://cdn.jsdelivr.net" />
@@ -19,14 +19,18 @@
         <span class="brand-mark">T</span>
         <span class="brand-copy">
           <strong>Superior Typst</strong>
-          <small>GitHub editor</small>
+          <small>GitHub and Codeberg editor</small>
         </span>
       </a>
       <div class="topbar-actions">
-        <button id="home-theme-btn" class="icon-btn" title="Toggle theme" aria-label="Toggle theme">☾</button>
+        <button id="home-theme-btn" type="button" class="icon-btn" title="Toggle theme" aria-label="Light theme" aria-pressed="false">☾</button>
         <button id="connect-github-btn" class="github-account-btn">
           <span class="github-dot"></span>
           <span id="github-account-label">Connect GitHub</span>
+        </button>
+        <button id="connect-codeberg-btn" class="github-account-btn">
+          <span class="github-dot"></span>
+          <span id="codeberg-account-label">Connect Codeberg</span>
         </button>
       </div>
     </header>
@@ -34,7 +38,7 @@
     <main class="home-main">
       <section class="hero">
         <h1>Superior Typst</h1>
-        <p>Paste in a GitHub link to get started</p>
+        <p>Paste a GitHub or Codeberg repository link to get started</p>
 
         <form id="open-repo-form" class="open-repo-card">
           <div class="repo-input-wrap">
@@ -44,7 +48,7 @@
               spellcheck="false"
               autocomplete="off"
               placeholder="https://github.com/owner/repository"
-              aria-label="GitHub repository URL" />
+              aria-label="GitHub or Codeberg repository URL" />
           </div>
           <button class="primary-btn" type="submit">Open project</button>
         </form>
@@ -64,26 +68,25 @@
         <div id="recent-empty" class="empty-state hidden">
           <div class="empty-icon">T</div>
           <h3>No recent projects yet</h3>
-          <p>Paste a GitHub repository above to open your first Typst project.</p>
+          <p>Paste a repository link above to open your first Typst project.</p>
         </div>
       </section>
 
-      <section class="projects-section github-search-section hidden">
-        <div class="section-heading-row">
-          <div>
-            <h2>Search GitHub</h2>
-            <p>Find repositories by name. Connected accounts can also find private repositories they can access.</p>
-          </div>
-        </div>
+      <details class="projects-section repo-search-section">
+        <summary>Search repositories</summary>
         <form id="github-search-form" class="search-row">
+          <select id="repo-search-provider" class="secondary-btn" aria-label="Repository provider">
+            <option value="github">GitHub</option>
+            <option value="codeberg">Codeberg</option>
+          </select>
           <div class="search-field grow">
             <span aria-hidden="true">⌕</span>
-            <input id="github-search-input" placeholder="Search repositories" />
+            <input id="github-search-input" aria-label="Repository name" placeholder="Search repositories" />
           </div>
           <button class="secondary-btn" type="submit">Search</button>
         </form>
-        <div id="github-search-results" class="project-grid search-results"></div>
-      </section>
+        <div id="github-search-results" class="project-grid search-results" aria-live="polite"></div>
+      </details>
     </main>
 
     <footer class="home-footer">
@@ -117,6 +120,7 @@
         <button id="commit-btn" class="primary-btn slim" disabled>
           Commit <span id="change-count-badge" class="button-badge hidden">0</span>
         </button>
+        <button id="grammar-toggle-btn" type="button" class="secondary-btn slim" aria-pressed="false" title="Check English prose in Typst files">Grammar</button>
         <button id="editor-account-btn" class="avatar-btn" title="GitHub account">GH</button>
       </div>
     </header>
@@ -161,6 +165,7 @@
             <span id="tab-dirty-dot" class="dirty-dot hidden">●</span>
           </div>
           <div class="tabbar-spacer"></div>
+          <button id="editor-theme-btn" type="button" class="tab-icon-btn" title="Toggle theme" aria-label="Light theme" aria-pressed="false">☾</button>
           <button id="editor-font-minus" class="tab-icon-btn" title="Decrease editor font size">A−</button>
           <button id="editor-font-plus" class="tab-icon-btn" title="Increase editor font size">A+</button>
         </div>
@@ -236,7 +241,7 @@
         </div>
         <button class="modal-close" data-close-modal aria-label="Close">×</button>
       </div>
-      <p class="modal-copy">Use a fine-grained personal access token with <strong>Contents: Read and write</strong> access to the repositories you want to edit. The token is sent only to GitHub's API.</p>
+      <p id="auth-token-copy" class="modal-copy"></p>
       <label class="field-label" for="github-token-input">Personal access token</label>
       <input id="github-token-input" class="text-input mono" type="password" spellcheck="false" autocomplete="off" placeholder="github_pat_…" />
       <label class="check-row">
@@ -252,7 +257,7 @@
       </div>
       <div class="token-help">
         <strong>Token setup</strong>
-        <span>GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens. Give it access only to the repos your group edits.</span>
+        <span id="auth-token-help"></span>
       </div>
     </div>
 

@@ -1,6 +1,6 @@
 /* Typst Git Editor
- * Static client-side GitHub + Typst editor.
- * GitHub tokens never pass through an application server.
+ * Static client-side GitHub and Codeberg editor for Typst.
+ * Tokens go directly to the API of the selected provider.
  */
 
 (() => {
@@ -10,7 +10,9 @@
   const STORAGE = {
     recents: 'typstgit.recents.v1',
     token: 'typstgit.githubToken',
+    codebergToken: 'typstgit.codebergToken',
     theme: 'typstgit.theme',
+    grammar: 'typstgit.grammar',
     fontSize: 'typstgit.editorFontSize',
   };
   const MAX_PROJECT_BYTES = 80 * 1024 * 1024;
@@ -29,8 +31,13 @@
   const $ = (id) => document.getElementById(id);
   const els = {};
   const state = {
+    provider: 'github',
     token: null,
     profile: null,
+    codebergToken: null,
+    codebergProfile: null,
+    authProvider: 'github',
+    authAttempt: 0,
     repo: null,
     branch: null,
     branches: [],
@@ -69,6 +76,13 @@
     editorModel: null,
     suppressEditorChange: false,
     monaco: null,
+    grammarEnabled: false,
+    grammarWorker: null,
+    grammarTimer: null,
+    grammarRequestId: 0,
+    grammarInFlight: null,
+    grammarResult: null,
+    grammarQuickFixes: null,
     editorResizeObserver: null,
     editorLayoutFrame: 0,
     compileTimer: null,
@@ -87,7 +101,7 @@
     promptResolver: null,
     activeModal: null,
     diagnostics: [],
-    sourceSearchOrder: [],
+    sourceSearchOrder: null,
     previewLastJump: null,
     previewSourceAnchors: [],
     previewAnchorMap: new WeakMap(),
@@ -102,13 +116,12 @@
   class GitHubClient {
     constructor(getToken) { this.getToken = getToken; }
 
-    async request(path, options = {}) {
+    async request(path, options = {}, token = this.getToken()) {
       const headers = {
         'Accept': 'application/vnd.github+json',
         'X-GitHub-Api-Version': API_VERSION,
         ...(options.headers || {}),
       };
-      const token = this.getToken();
       if (token) headers.Authorization = `Bearer ${token}`;
       if (options.body && typeof options.body !== 'string') {
         headers['Content-Type'] = 'application/json';
@@ -130,7 +143,7 @@
       return data;
     }
 
-    getProfile() { return this.request('/user'); }
+    getProfile(token) { return this.request('/user', {}, token); }
     getRepo(owner, repo) { return this.request(`/repos/${enc(owner)}/${enc(repo)}`); }
     getBranches(owner, repo) { return this.request(`/repos/${enc(owner)}/${enc(repo)}/branches?per_page=100`); }
     getRef(owner, repo, branch) {
@@ -173,6 +186,29 @@
   }
 
   const github = new GitHubClient(() => state.token);
+  let codebergClient, codebergClientPromise;
+  const themeButtons = ['home-theme-btn', 'editor-theme-btn'];
+
+  function repositoryProviderLabel(provider = state.provider) {
+    return provider === 'codeberg' ? 'Codeberg' : 'GitHub';
+  }
+
+  function repositoryClient(provider = state.provider) {
+    return provider === 'codeberg' ? codebergClient : github;
+  }
+
+  function ensureCodebergClient() {
+    if (!codebergClientPromise) {
+      codebergClientPromise = loadScript(new URL('./codeberg.js', document.baseURI).href).then(() => {
+        codebergClient = new window.CodebergClient(() => state.codebergToken);
+        return codebergClient;
+      }).catch(error => {
+        codebergClientPromise = null;
+        throw error;
+      });
+    }
+    return codebergClientPromise;
+  }
 
   function enc(s) { return encodeURIComponent(s); }
   function ext(path) {
@@ -249,16 +285,18 @@
 
   function cacheElements() {
     [
-      'home-view','editor-view','connect-github-btn','github-account-label','home-theme-btn','open-repo-form','repo-url-input',
-      'recent-projects','recent-empty','recent-search-input','github-search-form','github-search-input','github-search-results',
+      'home-view','editor-view','connect-github-btn','github-account-label','connect-codeberg-btn','codeberg-account-label',
+      'home-theme-btn','open-repo-form','repo-url-input',
+      'recent-projects','recent-empty','recent-search-input','github-search-form','github-search-input','github-search-results','repo-search-provider',
       'repo-owner-label','repo-name-label','repo-private-badge','repo-title-btn','branch-select','compile-status','refresh-repo-btn',
-      'download-pdf-btn','commit-btn','change-count-badge','editor-account-btn','file-count-label','new-file-btn','upload-file-btn','upload-folder-btn',
+      'download-pdf-btn','commit-btn','change-count-badge','grammar-toggle-btn','editor-account-btn','file-count-label','new-file-btn','upload-file-btn','upload-folder-btn',
       'rename-file-btn','delete-file-btn','file-search-input','file-tree','main-file-btn','main-file-label','upload-file-input','upload-folder-input',
       'sidebar-resizer','preview-resizer','code-pane','editor-container','binary-file-view','binary-file-name','binary-file-meta','download-binary-btn',
-      'tab-file-icon','tab-file-name','tab-dirty-dot','editor-font-minus','editor-font-plus','preview-page-label','zoom-out-btn','zoom-reset-btn',
+      'tab-file-icon','tab-file-name','tab-dirty-dot','editor-theme-btn','editor-font-minus','editor-font-plus','preview-page-label','zoom-out-btn','zoom-reset-btn',
       'zoom-in-btn','fit-preview-btn','preview-scroll','preview-stage','preview-loading','preview-error','preview-error-text','diagnostic-summary','diagnostic-list','preview-output',
-      'status-current-file','cursor-position','repo-sync-status','modal-backdrop','auth-modal','github-token-input','remember-token-checkbox',
-      'auth-error','disconnect-github-btn','save-github-token-btn','commit-modal','commit-summary','commit-message-input','commit-error',
+      'status-current-file','cursor-position','repo-sync-status','modal-backdrop','auth-modal','auth-modal-title','auth-token-copy','auth-token-help',
+      'github-token-input','remember-token-checkbox','auth-error','disconnect-github-btn','save-github-token-btn',
+      'commit-modal','commit-modal-title','commit-summary','commit-message-input','commit-error',
       'confirm-commit-btn','text-prompt-modal','text-prompt-kicker','text-prompt-title','text-prompt-label','text-prompt-input','text-prompt-error',
       'text-prompt-confirm','main-file-modal','main-file-list','image-paste-modal','image-paste-title','image-paste-destination',
       'image-paste-filename','image-paste-width','image-paste-caption','image-paste-kind-image','image-paste-kind-figure',
@@ -269,57 +307,103 @@
   async function boot() {
     cacheElements();
     loadTheme();
+    if (localStorage.getItem(STORAGE.grammar) === 'true') setGrammarEnabled(true);
     loadToken();
     bindEvents();
-    renderRecents();
     validateStoredToken();
     route();
   }
 
   function loadTheme() {
-    const saved = localStorage.getItem(STORAGE.theme) || 'dark';
-    document.documentElement.dataset.theme = saved;
-    els['home-theme-btn'] && (els['home-theme-btn'].textContent = saved === 'dark' ? '☾' : '☀');
+    applyTheme(localStorage.getItem(STORAGE.theme) === 'light' ? 'light' : 'dark');
+  }
+  function applyTheme(theme) {
+    const light = theme === 'light';
+    document.documentElement.dataset.theme = theme;
+    for (const id of themeButtons) {
+      els[id].textContent = light ? '☀' : '☾';
+      els[id].setAttribute('aria-pressed', String(light));
+    }
+    if (state.editor) state.monaco.editor.setTheme(light ? 'typst-light' : 'typst-dark');
   }
   function toggleTheme() {
     const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
-    document.documentElement.dataset.theme = next;
+    applyTheme(next);
     localStorage.setItem(STORAGE.theme, next);
-    els['home-theme-btn'].textContent = next === 'dark' ? '☾' : '☀';
-    if (state.editor && state.monaco) state.monaco.editor.setTheme(next === 'dark' ? 'typst-dark' : 'typst-light');
+  }
+  function toggleGrammar() {
+    setGrammarEnabled(!state.grammarEnabled);
+    localStorage.setItem(STORAGE.grammar, String(state.grammarEnabled));
+  }
+  function setGrammarEnabled(enabled) {
+    state.grammarEnabled = enabled;
+    els['grammar-toggle-btn'].setAttribute('aria-pressed', String(enabled));
+    if (enabled) {
+      if (state.monaco && !state.grammarQuickFixes) registerGrammarQuickFixes();
+      if (state.openPath) scheduleGrammarCheck();
+    } else {
+      state.grammarQuickFixes?.dispose();
+      state.grammarQuickFixes = null;
+      stopGrammarCheck();
+    }
   }
   function loadToken() {
     state.token = sessionStorage.getItem(STORAGE.token) || localStorage.getItem(STORAGE.token) || null;
+    state.codebergToken = sessionStorage.getItem(STORAGE.codebergToken) || localStorage.getItem(STORAGE.codebergToken) || null;
     updateAccountUI();
   }
   async function validateStoredToken() {
-    if (!state.token) return;
+    const token = state.token;
+    if (!token) return;
     try {
-      state.profile = await github.getProfile();
+      const profile = await github.getProfile(token);
+      if (state.token !== token) return;
+      state.profile = profile;
     } catch {
-      clearToken();
+      if (state.token === token) clearToken('github');
     }
     updateAccountUI();
   }
-  function saveToken(token, remember) {
-    sessionStorage.removeItem(STORAGE.token);
-    localStorage.removeItem(STORAGE.token);
-    (remember ? localStorage : sessionStorage).setItem(STORAGE.token, token);
-    state.token = token;
+  function repositoryToken(provider = state.provider) {
+    return provider === 'codeberg' ? state.codebergToken : state.token;
   }
-  function clearToken() {
-    sessionStorage.removeItem(STORAGE.token);
-    localStorage.removeItem(STORAGE.token);
-    state.token = null;
-    state.profile = null;
+  function saveToken(token, remember, provider) {
+    const key = provider === 'codeberg' ? STORAGE.codebergToken : STORAGE.token;
+    sessionStorage.removeItem(key);
+    localStorage.removeItem(key);
+    (remember ? localStorage : sessionStorage).setItem(key, token);
+    if (provider === 'codeberg') state.codebergToken = token;
+    else state.token = token;
+  }
+  function clearToken(provider) {
+    const key = provider === 'codeberg' ? STORAGE.codebergToken : STORAGE.token;
+    sessionStorage.removeItem(key);
+    localStorage.removeItem(key);
+    if (provider === 'codeberg') {
+      state.codebergToken = null;
+      state.codebergProfile = null;
+    } else {
+      state.token = null;
+      state.profile = null;
+    }
     updateAccountUI();
   }
   function updateAccountUI() {
     const connected = Boolean(state.token && state.profile);
     els['connect-github-btn']?.classList.toggle('connected', connected);
+    els['connect-codeberg-btn']?.classList.toggle('connected', Boolean(state.codebergToken));
     if (els['github-account-label']) els['github-account-label'].textContent = connected ? state.profile.login : (state.token ? 'Connecting…' : 'Connect GitHub');
-    if (els['editor-account-btn']) els['editor-account-btn'].textContent = connected ? state.profile.login.slice(0,2).toUpperCase() : 'GH';
-    els['disconnect-github-btn']?.classList.toggle('hidden', !state.token);
+    if (els['codeberg-account-label']) els['codeberg-account-label'].textContent = state.codebergToken ?
+      (state.codebergProfile?.login || 'Codeberg token saved') : 'Connect Codeberg';
+    if (els['editor-account-btn']) {
+      const codeberg = state.provider === 'codeberg';
+      const profile = codeberg ? state.codebergProfile : state.profile;
+      const label = `${repositoryProviderLabel()} account`;
+      els['editor-account-btn'].textContent = profile?.login?.slice(0, 2).toUpperCase() || (codeberg ? 'CB' : 'GH');
+      els['editor-account-btn'].title = label;
+      els['editor-account-btn'].setAttribute('aria-label', label);
+    }
+    els['disconnect-github-btn']?.classList.toggle('hidden', !repositoryToken(state.authProvider));
   }
 
   function bindEvents() {
@@ -327,12 +411,18 @@
     window.addEventListener('beforeunload', (e) => {
       if (state.changes.size) { e.preventDefault(); e.returnValue = ''; }
     });
-    els['home-theme-btn'].addEventListener('click', toggleTheme);
-    els['connect-github-btn'].addEventListener('click', openAuthModal);
-    els['editor-account-btn'].addEventListener('click', openAuthModal);
+    for (const id of themeButtons) els[id].addEventListener('click', toggleTheme);
+    els['grammar-toggle-btn'].addEventListener('click', toggleGrammar);
+    els['connect-github-btn'].addEventListener('click', () => openAuthModal('github'));
+    els['connect-codeberg-btn'].addEventListener('click', () => openAuthModal('codeberg'));
+    els['editor-account-btn'].addEventListener('click', () => openAuthModal());
     els['open-repo-form'].addEventListener('submit', e => { e.preventDefault(); navigateToRepoInput(els['repo-url-input'].value); });
     els['recent-search-input'].addEventListener('input', renderRecents);
-    els['github-search-form'].addEventListener('submit', handleGitHubSearch);
+    els['github-search-form'].addEventListener('submit', handleRepoSearch);
+    els['repo-search-provider'].addEventListener('change', () => {
+      repoSearchRequest++;
+      els['github-search-results'].replaceChildren();
+    });
     els['repo-title-btn'].addEventListener('click', () => { if (state.repo) window.open(state.repo.html_url, '_blank', 'noopener'); });
     els['branch-select'].addEventListener('change', onBranchChange);
     els['refresh-repo-btn'].addEventListener('click', () => reloadCurrentRepo(true));
@@ -354,8 +444,13 @@
     els['zoom-in-btn'].addEventListener('click', () => setPreviewZoom(state.previewZoom + .1));
     els['zoom-reset-btn'].addEventListener('click', () => setPreviewZoom(1));
     els['fit-preview-btn'].addEventListener('click', fitPreviewWidth);
-    els['save-github-token-btn'].addEventListener('click', connectGitHub);
-    els['disconnect-github-btn'].addEventListener('click', () => { clearToken(); closeModal(); toast('GitHub account disconnected.'); });
+    els['save-github-token-btn'].addEventListener('click', connectRepositoryAccount);
+    els['disconnect-github-btn'].addEventListener('click', () => {
+      state.authAttempt++;
+      clearToken(state.authProvider);
+      closeModal();
+      toast(`${repositoryProviderLabel(state.authProvider)} account disconnected.`);
+    });
     els['confirm-commit-btn'].addEventListener('click', commitChanges);
     els['text-prompt-confirm'].addEventListener('click', resolveTextPrompt);
     els['text-prompt-input'].addEventListener('keydown', e => { if (e.key === 'Enter') resolveTextPrompt(); });
@@ -448,6 +543,7 @@
     state.monaco = window.monaco;
     registerTypstLanguage();
     registerTypstPathCompletion();
+    if (state.grammarEnabled) registerGrammarQuickFixes();
     defineMonacoThemes();
     const fontSize = Math.max(11, Math.min(22, Number(localStorage.getItem(STORAGE.fontSize) || 14)));
     document.documentElement.style.setProperty('--editor-font-size', `${fontSize}px`);
@@ -683,13 +779,133 @@
   function maybeTriggerTypstPathSuggestions(changeEvent) {
     if (!state.editor || !state.openPath || ext(state.openPath) !== 'typ' || state.suppressEditorChange) return;
     if (!changeEvent?.changes?.length) return;
-    const inserted = changeEvent.changes.map(c => c.text).join('');
-    if (!inserted || inserted.length > 4 || !/[A-Za-z0-9_./-]$/.test(inserted)) return;
-    const model = state.editor.getModel();
-    const position = state.editor.getPosition();
-    if (!getTypstFileArgumentContext(model, position)) return;
-    queueMicrotask(() => {
-      if (state.editor && state.editor.hasTextFocus()) state.editor.trigger('typst-file-path', 'editor.action.triggerSuggest', {});
+    let inserted = '';
+    for (const { text } of changeEvent.changes) {
+      if (inserted.length + text.length > 4) return;
+      inserted += text;
+    }
+    if (!/[A-Za-z0-9_./-]$/.test(inserted)) return;
+    const path = state.openPath;
+    const revision = state.editRevision;
+    const repositorySerial = state.repositoryLoadSerial;
+    setTimeout(() => {
+      if (path !== state.openPath || revision !== state.editRevision ||
+          repositorySerial !== state.repositoryLoadSerial || !state.editor.hasTextFocus()) return;
+      if (getTypstFileArgumentContext(state.editor.getModel(), state.editor.getPosition())) {
+        state.editor.trigger('typst-file-path', 'editor.action.triggerSuggest', {});
+      }
+    }, 0);
+  }
+
+  function clearGrammarMarkers() {
+    if (!state.grammarResult) return;
+    state.monaco.editor.setModelMarkers(state.grammarResult.model, 'grammar', []);
+    state.grammarResult = null;
+  }
+
+  function stopGrammarCheck() {
+    clearTimeout(state.grammarTimer);
+    state.grammarTimer = null;
+    state.grammarWorker?.terminate();
+    state.grammarWorker = null;
+    state.grammarInFlight = null;
+    clearGrammarMarkers();
+  }
+
+  function scheduleGrammarCheck() {
+    clearTimeout(state.grammarTimer);
+    state.grammarTimer = setTimeout(() => {
+      state.grammarTimer = null;
+      requestGrammarCheck();
+    }, 300);
+  }
+
+  function isCurrentGrammarCheck(check) {
+    return state.grammarEnabled && check.serial === state.repositoryLoadSerial &&
+      check.path === state.openPath && check.model === state.editor?.getModel() &&
+      check.version === check.model.getVersionId();
+  }
+
+  function requestGrammarCheck() {
+    if (!state.grammarEnabled || state.grammarInFlight || ext(state.openPath || '') !== 'typ' ||
+        els['editor-view'].classList.contains('hidden') || els['editor-container'].classList.contains('hidden')) return;
+    const model = state.editor?.getModel();
+    if (!model) return;
+    const check = {
+      id: ++state.grammarRequestId, serial: state.repositoryLoadSerial,
+      path: state.openPath, model, version: model.getVersionId(),
+    };
+    try {
+      if (!state.grammarWorker) {
+        const worker = new Worker(new URL('./grammar-worker.js', document.baseURI));
+        state.grammarWorker = worker;
+        worker.onmessage = ({ data }) => {
+          const current = state.grammarInFlight;
+          if (state.grammarWorker !== worker || !current || data?.id !== current.id) return;
+          state.grammarInFlight = null;
+          if (data.error) { grammarCheckFailed(); return; }
+          if (isCurrentGrammarCheck(current)) showGrammarSuggestions(current, data.diagnostics);
+          else if (state.grammarTimer == null) requestGrammarCheck();
+        };
+        worker.onerror = event => {
+          event.preventDefault();
+          if (state.grammarWorker === worker) grammarCheckFailed();
+        };
+        worker.onmessageerror = () => {
+          if (state.grammarWorker === worker) grammarCheckFailed();
+        };
+      }
+      state.grammarInFlight = check;
+      state.grammarWorker.postMessage({ id: check.id, path: check.path, text: model.getValue() });
+    } catch {
+      grammarCheckFailed();
+    }
+  }
+
+  function grammarCheckFailed() {
+    setGrammarEnabled(false);
+    localStorage.setItem(STORAGE.grammar, 'false');
+    toast('Grammar checker stopped. Turn it on to retry.', 'error');
+  }
+
+  function showGrammarSuggestions(check, diagnostics) {
+    const fixes = diagnostics.map(({ start, end, message, replacement }) => {
+      const from = check.model.getPositionAt(start);
+      const to = check.model.getPositionAt(end);
+      const marker = {
+        startLineNumber: from.lineNumber, startColumn: from.column,
+        endLineNumber: to.lineNumber, endColumn: to.column,
+        message, source: 'Grammar', severity: state.monaco.MarkerSeverity.Info,
+      };
+      return { start, end, marker, replacement };
+    });
+    state.grammarResult = { ...check, fixes };
+    state.monaco.editor.setModelMarkers(check.model, 'grammar', fixes.map(fix => fix.marker));
+  }
+
+  function registerGrammarQuickFixes() {
+    state.grammarQuickFixes = state.monaco.languages.registerCodeActionProvider('typst', {
+      provideCodeActions(model, range) {
+        const result = state.grammarResult;
+        const actions = [];
+        if (result?.model === model && isCurrentGrammarCheck(result)) {
+          const start = model.getOffsetAt({ lineNumber: range.startLineNumber, column: range.startColumn });
+          const end = model.getOffsetAt({ lineNumber: range.endLineNumber, column: range.endColumn });
+          for (const fix of result.fixes) {
+            if (fix.end < start || fix.start > end) continue;
+            actions.push({
+              title: fix.replacement ? `Replace with “${fix.replacement}”` : 'Remove repeated word',
+              kind: 'quickfix',
+              diagnostics: [fix.marker],
+              edit: { edits: [{
+                resource: model.uri, versionId: result.version,
+                textEdit: { range: fix.marker, text: fix.replacement },
+              }] },
+            });
+          }
+        }
+        return { actions, dispose() {} };
+      },
     });
   }
 
@@ -837,13 +1053,14 @@
 
   function route() {
     const parsed = parseHash();
-    if (parsed?.type === 'repo' && isRepositoryLoaded(parsed.owner, parsed.repo, parsed.branch)) return;
+    if (parsed?.type === 'repo' && isRepositoryLoaded(parsed.owner, parsed.repo, parsed.branch, parsed.provider)) return;
     const serial = ++state.repositoryLoadSerial;
+    if (['text-prompt-modal', 'image-paste-modal', 'commit-modal'].includes(state.activeModal)) closeModal();
     if (!parsed || parsed.type === 'home') {
       showHome();
       return;
     }
-    if (parsed.type === 'repo') openRepository(parsed.owner, parsed.repo, parsed.branch, serial).catch(err => {
+    if (parsed.type === 'repo') openRepository(parsed.owner, parsed.repo, parsed.branch, serial, parsed.provider).catch(err => {
       if (serial === state.repositoryLoadSerial) handleFatalRepoError(err);
     });
   }
@@ -854,8 +1071,18 @@
     const parts = pathPart.split('/').filter(Boolean);
     if (!parts.length) return { type: 'home' };
     if (parts[0] === 'repo' && parts.length >= 3) {
-      const params = new URLSearchParams(queryPart || '');
-      return { type: 'repo', owner: decodeURIComponent(parts[1]), repo: decodeURIComponent(parts[2]), branch: params.get('branch') };
+      const provider = parts.length >= 4 && parts[1] === 'codeberg' ? 'codeberg' : 'github';
+      const ownerIndex = provider === 'codeberg' ? 2 : 1;
+      try {
+        return {
+          type: 'repo', provider,
+          owner: decodeURIComponent(parts[ownerIndex]),
+          repo: decodeURIComponent(parts[ownerIndex + 1]),
+          branch: new URLSearchParams(queryPart || '').get('branch'),
+        };
+      } catch {
+        return { type: 'home' };
+      }
     }
     return { type: 'home' };
   }
@@ -865,16 +1092,23 @@
     state.compileTimer = null;
     state.compileDueAt = 0;
     state.compileSerial++;
+    if (state.grammarEnabled) stopGrammarCheck();
     cancelPreviewSourceAnchorIndexing();
     els['editor-view'].classList.add('hidden');
     els['home-view'].classList.remove('hidden');
     renderRecents();
   }
 
+  function repoHash(provider, owner, repo, branch) {
+    const prefix = provider === 'codeberg' ? 'codeberg/' : '';
+    const query = branch ? `?branch=${enc(branch)}` : '';
+    return `#/repo/${prefix}${enc(owner)}/${enc(repo)}${query}`;
+  }
+
   function navigateToRepoInput(value) {
     try {
-      const { owner, repo } = parseRepoInput(value);
-      location.hash = `#/repo/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+      const { provider, owner, repo } = parseRepoInput(value);
+      location.hash = repoHash(provider, owner, repo);
     } catch (err) {
       toast(err.message, 'error');
     }
@@ -882,39 +1116,41 @@
 
   function parseRepoInput(value) {
     const input = String(value || '').trim();
-    if (!input) throw new Error('Enter a GitHub repository URL.');
-    let owner, repo;
-    if (/^https?:\/\//i.test(input)) {
-      const url = new URL(input);
-      if (!/(^|\.)github\.com$/i.test(url.hostname)) throw new Error('Only github.com repository URLs are supported.');
-      const parts = url.pathname.split('/').filter(Boolean);
-      if (parts.length < 2) throw new Error('That URL does not contain a repository.');
-      [owner, repo] = parts;
-    } else {
-      const parts = input.replace(/^github\.com\//i,'').split('/').filter(Boolean);
-      if (parts.length < 2) throw new Error('Use owner/repository or a full GitHub URL.');
-      [owner, repo] = parts;
+    if (!input) throw new Error('Enter a GitHub or Codeberg repository URL.');
+    let provider = 'github';
+    let path = input;
+    if (/^https?:\/\//i.test(input) || /^(?:www\.)?(?:github\.com|codeberg\.org)\//i.test(input)) {
+      const url = new URL(/^https?:\/\//i.test(input) ? input : `https://${input}`);
+      if (/^(?:www\.)?codeberg\.org$/i.test(url.hostname)) provider = 'codeberg';
+      else if (!/(^|\.)github\.com$/i.test(url.hostname)) throw new Error('Use a github.com or codeberg.org repository URL.');
+      path = url.pathname;
     }
-    repo = repo.replace(/\.git$/i,'');
-    if (!owner || !repo) throw new Error('Invalid GitHub repository.');
-    return { owner, repo };
+    const [ownerPart, repoPart] = path.split('/').filter(Boolean);
+    if (!ownerPart || !repoPart) throw new Error('Use owner/repository or a full GitHub or Codeberg URL.');
+    const owner = decodeURIComponent(ownerPart);
+    const repo = decodeURIComponent(repoPart).replace(/\.git$/i, '');
+    if (!repo) throw new Error('Invalid repository name.');
+    return { provider, owner, repo };
   }
 
-  function isRepositoryLoaded(owner, repo, requestedBranch) {
+  function isRepositoryLoaded(owner, repo, requestedBranch, provider = 'github') {
     return !els['editor-view'].classList.contains('hidden') && state.editor && state.headSha &&
       (!state.mainPath || (state.openPath && state.compilerHydrated)) &&
-      state.repo?.owner?.login === owner && state.repo?.name === repo &&
+      state.provider === provider && state.repo?.owner?.login === owner && state.repo?.name === repo &&
       state.branch === (requestedBranch || state.repo.default_branch);
   }
 
-  async function openRepository(owner, repo, requestedBranch, serial) {
-    if (isRepositoryLoaded(owner, repo, requestedBranch)) return;
+  async function openRepository(owner, repo, requestedBranch, serial, provider = 'github') {
+    if (isRepositoryLoaded(owner, repo, requestedBranch, provider)) return;
     if (serial === undefined) serial = ++state.repositoryLoadSerial;
     resetProjectState();
+    state.provider = provider;
+    updateAccountUI();
     els['home-view'].classList.add('hidden');
     els['editor-view'].classList.remove('hidden');
     setCompileStatus('busy', 'Loading repository');
-    setSyncStatus('Reading GitHub…');
+    const providerLabel = repositoryProviderLabel(provider);
+    setSyncStatus(`Reading ${providerLabel}…`);
 
     const editorReady = ensureMonaco();
     // Attach handlers immediately while repository requests run in parallel.
@@ -923,41 +1159,48 @@
       if (serial === state.repositoryLoadSerial) showCompileError(err);
     });
 
-    const meta = await github.getRepo(owner, repo);
+    const client = provider === 'codeberg' ? await ensureCodebergClient() : repositoryClient(provider);
+    if (serial !== state.repositoryLoadSerial) return;
+    const meta = await client.getRepo(owner, repo);
     if (serial !== state.repositoryLoadSerial) return;
     state.repo = meta;
     state.branch = requestedBranch || meta.default_branch;
     updateRepoHeader();
 
-    const [branches, ref] = await Promise.all([
-      github.getBranches(owner, repo).catch(() => []),
-      github.getRef(owner, repo, state.branch)
-    ]);
-    if (serial !== state.repositoryLoadSerial) return;
-    state.branches = branches;
     renderBranches();
-    if (!await loadTreeAtRef(ref.object.sha, serial)) return;
+    client.getBranches(owner, repo).then(branches => {
+      if (serial !== state.repositoryLoadSerial) return;
+      state.branches = branches;
+      renderBranches();
+    }).catch(() => {});
+    const ref = await client.getRef(owner, repo, state.branch);
+    if (serial !== state.repositoryLoadSerial) return;
+    if (!await loadTreeAtRef(ref.object.sha, serial, client)) return;
     chooseInitialMainFile();
     renderFileTree();
     addRecentProject();
 
-    if (state.mainPath) await openFile(state.mainPath);
-    else { await editorReady; if (serial === state.repositoryLoadSerial) showNoTypstFiles(); }
+    const openingFile = state.mainPath ? openFile(state.mainPath) : editorReady;
+    const hydratingFiles = hydrateCompilerFS();
+    // Share the main file request and discover dependencies while Monaco loads.
+    hydratingFiles.catch(() => {});
+    await openingFile;
     if (serial !== state.repositoryLoadSerial) return;
+    if (!state.mainPath) showNoTypstFiles();
 
-    setSyncStatus(`GitHub • ${state.branch}`);
-    hydrateCompilerFS().then(() => {
+    setSyncStatus(`${providerLabel} • ${state.branch}`);
+    hydratingFiles.then(() => {
       if (serial === state.repositoryLoadSerial) scheduleCompile(0);
     }).catch(showCompileError);
   }
 
-  async function loadTreeAtRef(commitSha, serial = state.repositoryLoadSerial) {
+  async function loadTreeAtRef(commitSha, serial = state.repositoryLoadSerial, client = repositoryClient()) {
     const { owner, name: repo } = state.repo;
-    const commit = await github.getCommit(owner.login, repo, commitSha);
+    const commit = await client.getCommit(owner.login, repo, commitSha);
     if (serial !== state.repositoryLoadSerial) return false;
-    const tree = await github.getTree(owner.login, repo, commit.tree.sha);
+    const tree = await client.getTree(owner.login, repo, commit.tree.sha);
     if (serial !== state.repositoryLoadSerial) return false;
-    if (tree.truncated) toast('This repository is very large. GitHub returned a truncated file tree.', 'error', 6000);
+    if (tree.truncated) toast(`This repository is very large. ${repositoryProviderLabel()} returned a truncated file tree.`, 'error', 6000);
     state.headSha = commitSha;
     state.baseTreeSha = commit.tree.sha;
     state.rawTree = tree.tree || [];
@@ -974,6 +1217,7 @@
     state.compileDueAt = 0;
     clearTimeout(state.fileTreeRenderTimer);
     clearTimeout(state.editorSyncTimer);
+    if (state.grammarEnabled) stopGrammarCheck();
     cancelPreviewSourceAnchorIndexing();
     disposePreviewPages();
     state.repo = null; state.branch = null; state.branches = []; state.headSha = null; state.baseTreeSha = null;
@@ -983,7 +1227,7 @@
     state.openPath = null; state.mainPath = null; state.deletedPaths = new Set(); state.expandedFolders = new Set();
     state.compilerHydrated = false; state.compilerHydrating = false; state.compilerHydrationPromise = null; state.compilerNeedsReset = true;
     state.compileInFlight = false; state.compileQueued = false; state.compilePromise = null; state.compileSerial++;
-    state.diagnostics = []; state.sourceSearchOrder = []; state.previewLastJump = null; state.previewSourceAnchors = []; state.previewAnchorMap = new WeakMap();
+    state.diagnostics = []; state.sourceSearchOrder = null; state.previewLastJump = null; state.previewSourceAnchors = []; state.previewAnchorMap = new WeakMap();
     if (state.previewSvgCache?.mode === 'cards') els['preview-output'].style.gap = state.previewSvgCache.previousGap;
     state.previewSvgCache = null;
     els['preview-output'].innerHTML = '';
@@ -999,7 +1243,9 @@
     els['repo-owner-label'].textContent = r.owner.login;
     els['repo-name-label'].textContent = r.name;
     els['repo-private-badge'].classList.toggle('hidden', !r.private);
-    els['repo-title-btn'].title = `Open ${r.full_name} on GitHub`;
+    const providerLabel = repositoryProviderLabel();
+    els['repo-title-btn'].title = `Open ${r.full_name} on ${providerLabel}`;
+    els['refresh-repo-btn'].title = `Reload from ${providerLabel}`;
   }
 
   function renderBranches() {
@@ -1018,38 +1264,42 @@
     if (state.changes.size && !confirm('Switch branches and discard your uncommitted changes?')) {
       els['branch-select'].value = state.branch; return;
     }
-    location.hash = `#/repo/${encodeURIComponent(state.repo.owner.login)}/${encodeURIComponent(state.repo.name)}?branch=${encodeURIComponent(next)}`;
+    location.hash = repoHash(state.provider, state.repo.owner.login, state.repo.name, next);
   }
 
   async function reloadCurrentRepo(confirmDiscard = false) {
     if (!state.repo) return;
-    if (confirmDiscard && state.changes.size && !confirm('Reload from GitHub and discard your uncommitted changes?')) return;
+    if (confirmDiscard && state.changes.size && !confirm(`Reload from ${repositoryProviderLabel()} and discard your uncommitted changes?`)) return;
     const owner = state.repo.owner.login, name = state.repo.name, branch = state.branch;
     await openRepositoryForce(owner, name, branch);
   }
 
-  async function openRepositoryForce(owner, repo, branch) {
+  async function openRepositoryForce(owner, repo, branch, provider = state.provider) {
     const serial = ++state.repositoryLoadSerial;
     resetProjectState();
+    state.provider = provider;
+    updateAccountUI();
     setCompileStatus('busy', 'Reloading repository');
-    const meta = await github.getRepo(owner, repo);
+    const client = provider === 'codeberg' ? await ensureCodebergClient() : repositoryClient(provider);
+    if (serial !== state.repositoryLoadSerial) return;
+    const meta = await client.getRepo(owner, repo);
     if (serial !== state.repositoryLoadSerial) return;
     state.repo = meta; state.branch = branch || meta.default_branch;
     updateRepoHeader();
     const [ref, branches] = await Promise.all([
-      github.getRef(owner, repo, state.branch),
-      github.getBranches(owner, repo).catch(() => [])
+      client.getRef(owner, repo, state.branch),
+      client.getBranches(owner, repo).catch(() => [])
     ]);
     if (serial !== state.repositoryLoadSerial) return;
     state.branches = branches;
     renderBranches();
-    if (!await loadTreeAtRef(ref.object.sha, serial)) return;
+    if (!await loadTreeAtRef(ref.object.sha, serial, client)) return;
     chooseInitialMainFile();
     renderFileTree();
     addRecentProject();
     if (state.mainPath) await openFile(state.mainPath);
     if (serial !== state.repositoryLoadSerial) return;
-    setSyncStatus(`GitHub • ${state.branch}`);
+    setSyncStatus(`${repositoryProviderLabel(provider)} • ${state.branch}`);
     await hydrateCompilerFS();
     await compilePreview();
   }
@@ -1276,8 +1526,9 @@
     const requests = state.fileRequests;
     const fileIndex = state.fileIndex;
     const { owner, name } = state.repo;
+    const client = repositoryClient();
     const request = (async () => {
-      const blob = await github.getBlob(owner.login, name, meta.sha);
+      const blob = await client.getBlob(owner.login, name, meta.sha);
       // A late response must not populate a different project or replaced file.
       if (state.fileRequests !== requests || state.fileIndex !== fileIndex || fileIndex.get(path) !== meta) {
         const error = new Error('Project changed while loading a file.');
@@ -1304,15 +1555,28 @@
     return TEXT_EXTENSIONS.has(e) || e === '';
   }
 
+  let fileOpenRequest = 0;
+
   async function openFile(path) {
     const serial = state.repositoryLoadSerial;
     const fileIndex = state.fileIndex;
     if (state.deletedPaths.has(path)) return;
-    if (state.openPath && state.openPath !== path) await flushEditorSync();
-    if (serial !== state.repositoryLoadSerial || fileIndex !== state.fileIndex) return;
+    const request = ++fileOpenRequest;
+    const isCurrent = () => request === fileOpenRequest && serial === state.repositoryLoadSerial &&
+      fileIndex === state.fileIndex && !state.deletedPaths.has(path);
     const [bytes] = await Promise.all([getFileBytes(path), ensureMonaco()]);
-    if (serial !== state.repositoryLoadSerial || fileIndex !== state.fileIndex) return;
+    if (!isCurrent()) return;
+    // Save edits made while the next file was downloading before replacing the model.
+    while (state.editorSyncPending) {
+      await syncOpenFileFromEditor();
+      if (!isCurrent()) return;
+    }
+    const currentBytes = state.fileBytes.get(path) || bytes;
     state.openPath = path;
+    if (state.grammarEnabled) {
+      clearGrammarMarkers();
+      scheduleGrammarCheck();
+    }
     const expanded = expandParents(path);
     if (expanded) renderFileTree();
     else updateFileTreeSelection(path);
@@ -1323,16 +1587,16 @@
     els['tab-file-icon'].textContent = icon.label;
     updateDirtyTab();
 
-    if (!isTextPath(path) || looksBinary(bytes)) {
+    if (!isTextPath(path) || looksBinary(currentBytes)) {
       els['editor-container'].classList.add('hidden');
       els['binary-file-view'].classList.remove('hidden');
       els['binary-file-name'].textContent = basename(path);
-      els['binary-file-meta'].textContent = `${formatBytes(bytes.length)} • ${ext(path).toUpperCase() || 'binary'} file`;
+      els['binary-file-meta'].textContent = `${formatBytes(currentBytes.length)} • ${ext(path).toUpperCase() || 'binary'} file`;
       return;
     }
     els['binary-file-view'].classList.add('hidden');
     els['editor-container'].classList.remove('hidden');
-    const text = sourceText(path) || decoder.decode(bytes);
+    const text = sourceText(path) || decoder.decode(currentBytes);
     state.suppressEditorChange = true;
     state.editor.setValue(text);
     const language = ext(path) === 'typ' ? 'typst' : languageForPath(path);
@@ -1378,11 +1642,14 @@
     // Publish completed snapshots while typing, then compile the newest edit.
     // Cancelling every in-flight result would starve a long document's preview.
     state.editRevision++;
-    releasePreviewNavigationPage();
+    releasePreviewNavigationPage(true);
     cancelPreviewSourceAnchorIndexing();
-    state.previewSourceAnchors = [];
-    state.previewAnchorMap = new WeakMap();
+    if (state.previewSourceAnchors.length) {
+      state.previewSourceAnchors = [];
+      state.previewAnchorMap = new WeakMap();
+    }
     if (state.mainPath) scheduleCompile();
+    if (state.grammarEnabled) scheduleGrammarCheck();
     maybeTriggerTypstPathSuggestions(changeEvent);
   }
 
@@ -1483,6 +1750,14 @@
       state.compilerHydrating = true;
       try {
         setCompileStatus('busy', 'Loading project files');
+        const entries = [...fileIndex.entries()].filter(([path, meta]) =>
+          !state.deletedPaths.has(path) && (meta.size || 0) <= MAX_SINGLE_BLOB_BYTES
+        );
+        const allTotal = entries.reduce((sum, [, meta]) => sum + (meta.size || 0), 0);
+        // Repository reads can run before WASM is ready. Await resets separately so
+        // a failed dependency read never releases the shadow-FS write queue.
+        const selection = force ? Promise.resolve(entries) : collectCompilerDependencyEntries(entries);
+        selection.catch(() => {});
         await waitForTypstRuntime();
         checkCurrent();
         await state.shadowSyncTail;
@@ -1497,15 +1772,10 @@
         await window.$typst.resetShadow();
         checkCurrent();
 
-        const entries = [...state.fileIndex.entries()].filter(([path, meta]) =>
-          !state.deletedPaths.has(path) && (meta.size || 0) <= MAX_SINGLE_BLOB_BYTES
-        );
-        const allTotal = entries.reduce((sum, [, meta]) => sum + (meta.size || 0), 0);
-
         // Normal startup follows literal include/import/file references from
         // the selected main document instead of downloading every repository
         // blob. Dynamic file access falls back to the force-hydration retry.
-        let selected = force ? entries : await collectCompilerDependencyEntries(entries);
+        let selected = await selection;
         checkCurrent();
         let selectedTotal = selected.reduce((sum, [, meta]) => sum + (meta.size || 0), 0);
         if (selectedTotal > MAX_PROJECT_BYTES || (force && allTotal > MAX_PROJECT_BYTES)) {
@@ -1773,12 +2043,14 @@
 
     const svg = result.svgParts ? (result.svg || '') : (typeof result.svg === 'string' ? result.svg : await window.$typst.svg({ vectorData: result.result }));
     if (!isCurrent()) return;
-    state.diagnostics = diagnostics;
-    renderDiagnostics(diagnostics);
+    if (revision === state.editRevision) {
+      state.diagnostics = diagnostics;
+      renderDiagnostics(diagnostics);
+    }
     installPreviewSvg(svg, result.svgParts);
     els['preview-loading'].classList.add('hidden');
     normalizePreviewSvg();
-    state.sourceSearchOrder = buildSourceSearchOrder();
+    state.sourceSearchOrder = null;
     schedulePreviewSourceAnchorIndexing();
     setPreviewZoom(state.previewZoom, false);
     els['download-pdf-btn'].disabled = false;
@@ -1949,7 +2221,9 @@
         <pre class="diagnostic-detail">${escapeHtml(`${diag.message}\n${diagnosticLocationLabel(diag)}${hints}${trace}${occurrences}`)}</pre>`;
       const activate = async () => {
         row.classList.toggle('expanded');
-        await openDiagnosticLocation(diag).catch(err => toast(err.message, 'error'));
+        await openDiagnosticLocation(diag).catch(err => {
+          if (err?.name !== 'AbortError') toast(err.message, 'error');
+        });
       };
       row.addEventListener('click', activate);
       row.addEventListener('keydown', e => {
@@ -2029,17 +2303,18 @@
       const candidate = effectivePaths().find(p => basename(p) === basename(path || ''));
       if (candidate) path = candidate;
     }
-    if (!path || !state.fileIndex.has(path)) return;
-    await openFile(path);
-    if (!diag.range || !isTextPath(path)) return;
-    const model = state.editor.getModel();
-    const startLine = Math.max(1, diag.range.startLine + 1);
-    const endLine = Math.max(startLine, diag.range.endLine + 1);
-    const startColumn = Math.max(1, diag.range.startColumn || 1);
-    const endColumn = Math.max(startColumn, diag.range.endColumn || startColumn);
-    const selection = new state.monaco.Range(startLine, startColumn, endLine, endColumn);
-    state.editor.setSelection(selection);
-    state.editor.revealRangeInCenter(selection, state.monaco.editor.ScrollType.Smooth);
+    if (!path || !state.fileIndex.has(path) || state.deletedPaths.has(path)) return;
+    const serial = state.repositoryLoadSerial;
+    if (state.openPath !== path || !state.editor?.getModel() || els['editor-container'].classList.contains('hidden')) {
+      await openFile(path);
+    }
+    if (serial !== state.repositoryLoadSerial || state.openPath !== path ||
+        !isTextPath(path) || els['editor-container'].classList.contains('hidden')) return;
+    const range = diagnosticRangeForModel(diag, state.editor.getModel());
+    if (range) {
+      state.editor.setSelection(range);
+      state.editor.revealRangeInCenter(range, state.monaco.editor.ScrollType.Smooth);
+    }
     state.editor.focus();
   }
 
@@ -2073,16 +2348,23 @@
     state.previewMountTimer = null;
   }
 
-  function releasePreviewNavigationPage() {
+  function releasePreviewNavigationPage(deferUnmount = false) {
     const cache = state.previewSvgCache;
     const page = cache?.pinnedPage;
     if (!page) return;
     page.navigationPinned = false;
     cache.pinnedPage = null;
-    if (!page.visible) {
+    const unmount = () => {
+      if (cache !== state.previewSvgCache || page.visible || page.navigationPinned || !page.group) return;
       page.svg.replaceChildren();
       page.group = null;
       page.mountedRaw = null;
+    };
+    if (!page.visible && page.group) {
+      // Releasing the pin during typing must not remove SVG glyphs in the
+      // Monaco change event. Recheck visibility in case scrolling caught up.
+      if (deferUnmount) setTimeout(unmount, 0);
+      else unmount();
     }
   }
 
@@ -2203,13 +2485,16 @@
       const dimensions = [];
       for (let index = 0; index < parts.pages.length; index++) {
         const previous = reusable && cache.pages[index];
-        if (previous?.raw === parts.pages[index]) { dimensions.push(previous); continue; }
+        if (previous && parts.pages[index].startsWith(previous.header)) {
+          dimensions.push(previous);
+          continue;
+        }
         const header = /^<g\b(?:[^>"']|"[^"]*"|'[^']*')*>/.exec(parts.pages[index]);
         const group = header && parseNodes(header[0] + (header[0].endsWith('/>') ? '' : '</g>'))[0];
         const width = parseFloat(group?.getAttribute('data-page-width'));
         const height = parseFloat(group?.getAttribute('data-page-height'));
         if (!group?.classList.contains('typst-page') || !(width > 0 && height > 0)) return false;
-        dimensions.push({ width, height });
+        dimensions.push({ width, height, header: header[0] });
       }
       const pageTemplate = template.cloneNode(false);
       pageTemplate.removeAttribute('id');
@@ -2244,8 +2529,11 @@
           cache.pages[index] = record;
           if (reusable) output.appendChild(node);
         }
+        const geometryChanged = record !== dimensions[index];
         Object.assign(record, dimensions[index], { raw: parts.pages[index] });
-        if (!reusable || cache.opening !== parts.opening) applyAttributes(record.svg, pageTemplate);
+        const rootChanged = !reusable || cache.opening !== parts.opening;
+        if (rootChanged) applyAttributes(record.svg, pageTemplate);
+        if (!geometryChanged && !rootChanged) continue;
         for (const [name, value] of Object.entries({ width: record.width + 'px', height: record.height + 'px' })) {
           if (record.node.style[name] !== value) record.node.style[name] = value;
         }
@@ -2488,19 +2776,24 @@
   }
 
   async function exportPdf() {
-    if (!state.mainPath) return;
+    const { mainPath, repositoryLoadSerial } = state;
+    if (!mainPath) return;
+    const isCurrent = () => repositoryLoadSerial === state.repositoryLoadSerial && mainPath === state.mainPath;
     try {
       await flushEditorSync();
+      if (!isCurrent()) return;
       setCompileStatus('busy','Exporting PDF');
       await hydrateCompilerFS();
-      const pdf = await window.$typst.pdf({ mainFilePath: `/repo/${state.mainPath}`, root: '/repo' });
+      if (!isCurrent()) return;
+      const pdf = await window.$typst.pdf({ mainFilePath: `/repo/${mainPath}`, root: '/repo' });
+      if (!isCurrent()) return;
       const blob = new Blob([pdf], { type:'application/pdf' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = url; a.download = `${basename(state.mainPath).replace(/\.typ$/i,'') || 'document'}.pdf`; a.click();
+      a.href = url; a.download = `${basename(mainPath).replace(/\.typ$/i,'') || 'document'}.pdf`; a.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
       setCompileStatus('ok','Up to date');
-    } catch (err) { showCompileError(err); }
+    } catch (err) { if (isCurrent()) showCompileError(err); }
   }
 
   function setPreviewZoom(value, updateFit = true) {
@@ -2525,27 +2818,34 @@
   }
 
   async function createNewFile() {
+    const serial = state.repositoryLoadSerial;
     const suggested = state.openPath ? `${dirname(state.openPath) ? dirname(state.openPath) + '/' : ''}new.typ` : 'new.typ';
     const path = await textPrompt({ title:'New file', kicker:'Project', label:'File path', value:suggested, action:'Create' });
-    if (!path) return;
+    if (!path || serial !== state.repositoryLoadSerial) return;
     const clean = normalizeRepoPath(path);
     if (!clean || clean.endsWith('/')) return toast('Enter a file name, not only a folder.','error');
-    if (state.fileIndex.has(clean) && !state.deletedPaths.has(clean)) return toast('A file already exists at that path.','error');
+    const previous = state.fileIndex.get(clean);
+    if (previous && !state.deletedPaths.has(clean)) return toast('A file already exists at that path.','error');
     const initial = ext(clean) === 'typ' ? '= New document\n\nStart writing here.\n' : '';
     const bytes = encoder.encode(initial);
-    state.fileIndex.set(clean, { path:clean, type:'blob', mode:'100644', size:bytes.length, existing:false, bytes });
+    const existing = Boolean(previous?.existing);
+    state.fileIndex.set(clean, { ...previous, path:clean, type:'blob', mode:previous?.mode || '100644', size:bytes.length, existing, bytes });
     invalidatePathCaches();
     state.fileBytes.set(clean, bytes);
     state.sourceTextCache.set(clean, initial);
-    state.changes.set(clean, { type:'add', bytes });
+    if (existing && sameBytes(state.originalBytes.get(clean), bytes)) state.changes.delete(clean);
+    else state.changes.set(clean, { type:existing ? 'modify' : 'add', bytes });
     state.deletedPaths.delete(clean);
     expandParents(clean);
     if (window.$typst) await window.$typst.mapShadow(`/repo/${clean}`, bytes);
+    if (serial !== state.repositoryLoadSerial) return;
     if (!state.mainPath && ext(clean) === 'typ') { state.mainPath = clean; els['main-file-label'].textContent = clean; }
-    renderFileTree(); updateChangeUI(); await openFile(clean); scheduleCompile(100);
+    renderFileTree(); updateChangeUI(); await openFile(clean);
+    if (serial === state.repositoryLoadSerial) scheduleCompile(100);
   }
 
   async function setWorkingFile(path, bytes) {
+    const serial = state.repositoryLoadSerial;
     const clean = normalizeRepoPath(path);
     const previous = state.fileIndex.get(clean);
     const existing = Boolean(previous?.existing);
@@ -2567,6 +2867,7 @@
     state.deletedPaths.delete(clean);
     if (window.$typst && shouldHydratePriority(clean)) {
       const mapped = await window.$typst.mapShadow(`/repo/${clean}`, bytes);
+      if (serial !== state.repositoryLoadSerial) return;
       if (mapped === false) throw new Error(`Typst could not map project file: ${clean}`);
     }
     expandParents(clean);
@@ -2578,6 +2879,7 @@
     const files = [...(input.files || [])];
     input.value = '';
     if (!files.length) return;
+    const serial = state.repositoryLoadSerial;
     const isFolderUpload = input === els['upload-folder-input'];
     const baseDir = isFolderUpload ? '' : (state.openPath ? dirname(state.openPath) : '');
     let added = 0;
@@ -2592,12 +2894,14 @@
         continue;
       }
       const bytes = new Uint8Array(await file.arrayBuffer());
+      if (serial !== state.repositoryLoadSerial) return;
       await setWorkingFile(path, bytes);
+      if (serial !== state.repositoryLoadSerial) return;
       added++;
     }
     renderFileTree();
     updateChangeUI();
-    state.sourceSearchOrder = buildSourceSearchOrder();
+    state.sourceSearchOrder = null;
     scheduleCompile(100);
     const folderWord = isFolderUpload ? ' from the folder' : '';
     toast(`${added} file${added === 1 ? '' : 's'}${folderWord} added${skipped ? `, ${skipped} skipped` : ''}.`, 'success');
@@ -2725,15 +3029,19 @@
     event.stopPropagation();
     const files = imageItems.map(item => item.getAsFile()).filter(Boolean);
     if (!files.length) return;
+    const serial = state.repositoryLoadSerial;
     const snippets = [];
     let created = 0;
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const options = await imagePastePrompt(file, i, files.length);
+      if (serial !== state.repositoryLoadSerial) return;
       if (!options) break;
       const bytes = new Uint8Array(await file.arrayBuffer());
+      if (serial !== state.repositoryLoadSerial) return;
       const path = uniquePastedImagePath(options.filename);
       await setWorkingFile(path, bytes);
+      if (serial !== state.repositoryLoadSerial) return;
       const relative = relativeProjectPath(dirname(state.openPath), path);
       snippets.push(pastedImageSnippet(relative, options));
       created++;
@@ -2753,7 +3061,7 @@
     state.editor.focus();
     renderFileTree();
     updateChangeUI();
-    state.sourceSearchOrder = buildSourceSearchOrder();
+    state.sourceSearchOrder = null;
     scheduleCompile(100);
     toast(`${created} pasted image${created === 1 ? '' : 's'} added to assets and inserted.`, 'success');
   }
@@ -2799,6 +3107,10 @@
     return order;
   }
 
+  function getSourceSearchOrder() {
+    return state.sourceSearchOrder ??= buildSourceSearchOrder();
+  }
+
   function escapeRegex(value) {
     return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
@@ -2806,7 +3118,7 @@
   function findTextInSource(text) {
     const cleaned = String(text || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
     if (!cleaned) return null;
-    const paths = state.sourceSearchOrder.length ? state.sourceSearchOrder : buildSourceSearchOrder();
+    const paths = getSourceSearchOrder();
     const words = cleaned.split(/\s+/).filter(Boolean);
     const probes = [cleaned];
     for (const size of [8, 6, 4, 3, 2]) {
@@ -2838,7 +3150,7 @@
 
   function findAssetReferenceSource(assetPath) {
     if (!assetPath) return null;
-    const paths = state.sourceSearchOrder.length ? state.sourceSearchOrder : buildSourceSearchOrder();
+    const paths = getSourceSearchOrder();
     for (const sourcePath of paths) {
       const source = sourceText(sourcePath);
       if (!source) continue;
@@ -2947,7 +3259,7 @@
   function sourceCandidatesForRenderedText(text) {
     const probes = textSearchProbes(text);
     if (!probes.length) return [];
-    const paths = state.sourceSearchOrder.length ? state.sourceSearchOrder : buildSourceSearchOrder();
+    const paths = getSourceSearchOrder();
     for (let probeIndex = 0; probeIndex < probes.length; probeIndex++) {
       const probe = probes[probeIndex];
       const candidates = [];
@@ -2981,7 +3293,7 @@
     state.previewAnchorMap = new WeakMap();
 
     const generation = state.previewIndexGeneration;
-    const elements = [...els['preview-output'].querySelectorAll('.typst-text, image')];
+    let elements;
     const lastOffsetByPath = new Map();
     const candidateCache = new Map();
     let index = 0;
@@ -2997,6 +3309,7 @@
     const work = deadline => {
       state.previewIndexHandle = null;
       if (generation !== state.previewIndexGeneration) return;
+      elements ??= els['preview-output'].querySelectorAll('.typst-text, image');
 
       let processed = 0;
       const started = performance.now();
@@ -3039,7 +3352,7 @@
 
     // Source links have an on-demand fallback. Build the full index only after
     // the preview has settled rather than competing with continuous typing.
-    if (elements.length) state.previewIndexStartTimer = setTimeout(() => {
+    state.previewIndexStartTimer = setTimeout(() => {
       state.previewIndexStartTimer = null;
       if (generation === state.previewIndexGeneration) schedule(work);
     }, 250);
@@ -3210,35 +3523,52 @@
   }
 
   async function renameSelectedFile() {
-    if (!state.openPath) return;
+    const { openPath: oldPath, repositoryLoadSerial: serial } = state;
+    if (!oldPath) return;
     await flushEditorSync();
-    const oldPath = state.openPath;
+    if (serial !== state.repositoryLoadSerial || state.openPath !== oldPath) return;
     const newValue = await textPrompt({ title:'Rename file', kicker:'Project', label:'New path', value:oldPath, action:'Rename' });
-    if (!newValue) return;
+    if (!newValue || serial !== state.repositoryLoadSerial) return;
     const newPath = normalizeRepoPath(newValue);
     if (!newPath || newPath === oldPath) return;
-    if (state.fileIndex.has(newPath) && !state.deletedPaths.has(newPath)) return toast('A file already exists at that path.','error');
     const bytes = await getFileBytes(oldPath);
+    if (serial !== state.repositoryLoadSerial) return;
+    const destination = state.fileIndex.get(newPath);
+    if (destination && !state.deletedPaths.has(newPath)) return toast('A file already exists at that path.','error');
     const oldMeta = state.fileIndex.get(oldPath);
     if (oldMeta?.existing) {
       state.changes.set(oldPath, { type:'delete' }); state.deletedPaths.add(oldPath); state.sourceTextCache.delete(oldPath);
     } else {
       state.changes.delete(oldPath); state.fileIndex.delete(oldPath); state.fileBytes.delete(oldPath); state.sourceTextCache.delete(oldPath);
     }
-    state.fileIndex.set(newPath, { path:newPath, type:'blob', mode:oldMeta?.mode || '100644', size:bytes.length, existing:false, bytes });
+    const existing = Boolean(destination?.existing);
+    const renameFrom = existing ? undefined : (oldMeta?.existing ? oldPath : oldMeta?.renameFrom);
+    state.fileIndex.set(newPath, {
+      ...destination, path:newPath, type:'blob', mode:destination?.mode || oldMeta?.mode || '100644',
+      size:bytes.length, existing, bytes, renameFrom,
+    });
     invalidatePathCaches();
     state.fileBytes.set(newPath, bytes);
     state.sourceTextCache.delete(newPath);
-    state.changes.set(newPath, { type:'add', bytes });
+    if (existing && sameBytes(state.originalBytes.get(newPath), bytes)) state.changes.delete(newPath);
+    else state.changes.set(newPath, { type:existing ? 'modify' : 'add', bytes });
+    state.deletedPaths.delete(newPath);
     if (state.mainPath === oldPath) { state.mainPath = newPath; els['main-file-label'].textContent = newPath; }
-    if (window.$typst) { await window.$typst.unmapShadow(`/repo/${oldPath}`); await window.$typst.mapShadow(`/repo/${newPath}`, bytes); }
-    expandParents(newPath); renderFileTree(); updateChangeUI(); await openFile(newPath); scheduleCompile(100);
+    if (window.$typst) {
+      await window.$typst.unmapShadow(`/repo/${oldPath}`);
+      if (serial !== state.repositoryLoadSerial) return;
+      await window.$typst.mapShadow(`/repo/${newPath}`, bytes);
+      if (serial !== state.repositoryLoadSerial) return;
+    }
+    expandParents(newPath); renderFileTree(); updateChangeUI(); await openFile(newPath);
+    if (serial === state.repositoryLoadSerial) scheduleCompile(100);
   }
 
   async function deleteSelectedFile() {
-    if (!state.openPath) return;
+    const { openPath: path, repositoryLoadSerial: serial } = state;
+    if (!path) return;
     await flushEditorSync();
-    const path = state.openPath;
+    if (serial !== state.repositoryLoadSerial || state.openPath !== path) return;
     if (!confirm(`Delete ${path} from the next commit?`)) return;
     const meta = state.fileIndex.get(path);
     if (meta?.existing) {
@@ -3248,12 +3578,13 @@
     }
     invalidatePathCaches();
     if (window.$typst) await window.$typst.unmapShadow(`/repo/${path}`);
+    if (serial !== state.repositoryLoadSerial) return;
     if (state.mainPath === path) chooseInitialMainFile();
     const next = state.mainPath || effectivePaths()[0] || null;
     state.openPath = null;
     renderFileTree(); updateChangeUI();
     if (next) await openFile(next); else showNoTypstFiles();
-    scheduleCompile(100);
+    if (serial === state.repositoryLoadSerial) scheduleCompile(100);
   }
 
   function downloadCurrentBinary() {
@@ -3288,7 +3619,9 @@
 
   function openCommitModal() {
     if (!state.changes.size) return;
-    if (!state.token) { openAuthModal(); toast('Connect GitHub before committing changes.','error'); return; }
+    const label = repositoryProviderLabel();
+    if (!repositoryToken()) { openAuthModal(); toast(`Connect ${label} before committing changes.`, 'error'); return; }
+    els['commit-modal-title'].textContent = `Commit to ${label}`;
     els['commit-summary'].innerHTML = '';
     for (const [path, change] of [...state.changes.entries()].sort(([a],[b])=>a.localeCompare(b))) {
       const row = document.createElement('div'); row.className = 'commit-summary-row';
@@ -3305,54 +3638,131 @@
     const message = els['commit-message-input'].value.trim();
     if (!message) return showInlineError(els['commit-error'],'Enter a commit message.');
     const btn = els['confirm-commit-btn'];
+    if (btn.disabled || !state.repo) return;
+    const { repo: repository, provider, branch, headSha, baseTreeSha, repositoryLoadSerial, fileIndex } = state;
+    const { owner: { login: owner }, name: repo } = repository;
+    const isCurrent = () => repositoryLoadSerial === state.repositoryLoadSerial && fileIndex === state.fileIndex;
     const oldText = btn.textContent; btn.disabled = true; btn.textContent = 'Committing…';
     els['commit-error'].classList.add('hidden');
     try {
       await flushEditorSync();
-      const owner = state.repo.owner.login, repo = state.repo.name;
-      const latestRef = await github.getRef(owner, repo, state.branch);
-      if (latestRef.object.sha !== state.headSha) throw new Error('The branch changed on GitHub after you opened it. Reload the project before committing so you do not overwrite somebody else’s work.');
-      const treeEntries = [];
-      for (const [path, change] of state.changes) {
-        if (change.type === 'delete') {
-          treeEntries.push({ path, mode: state.fileIndex.get(path)?.mode || '100644', type:'blob', sha:null });
-          continue;
-        }
-        const blob = await github.createBlob(owner, repo, change.bytes);
-        treeEntries.push({ path, mode: state.fileIndex.get(path)?.mode || '100644', type:'blob', sha:blob.sha });
+      if (!isCurrent()) return;
+      const snapshot = new Map([...state.changes].map(([path, change]) => [
+        path, {
+          ...change, sha: fileIndex.get(path)?.sha,
+          mode: fileIndex.get(path)?.mode || '100644',
+          renameFrom: fileIndex.get(path)?.renameFrom,
+        },
+      ]));
+      if (!snapshot.size) {
+        if (state.activeModal === 'commit-modal') closeModal();
+        return;
       }
-      const newTree = await github.createTree(owner, repo, state.baseTreeSha, treeEntries);
-      const commit = await github.createCommit(owner, repo, message, newTree.sha, state.headSha);
-      await github.updateRef(owner, repo, state.branch, commit.sha);
-      closeModal();
-      toast(`Committed ${state.changes.size} change${state.changes.size === 1 ? '' : 's'} to ${state.branch}.`, 'success', 5000);
-      await openRepositoryForce(owner, repo, state.branch);
+      const result = provider === 'codeberg'
+        ? await repositoryClient(provider).commitFiles(owner, repo, branch, message, headSha, snapshot, isCurrent)
+        : await commitGitHubFiles({ owner, repo, branch, headSha, baseTreeSha }, message, snapshot, isCurrent);
+      if (!isCurrent() || !result) return;
+      const branchAdvanced = result.parentSha && result.parentSha !== headSha;
+      // Forgejo can accept a commit atop a concurrent update to unrelated files.
+      // Keep the old head check until a reload refreshes those files.
+      if (!branchAdvanced) {
+        state.headSha = result.sha;
+        state.baseTreeSha = result.treeSha;
+      }
+      acceptCommittedFiles(result.treeEntries, snapshot);
+      if (state.activeModal === 'commit-modal') closeModal();
+      const success = `Committed ${snapshot.size} change${snapshot.size === 1 ? '' : 's'} to ${branch}.`;
+      toast(branchAdvanced ? `${success} Reload to pick up other changes to this branch before committing again.` : success, 'success', 5000);
     } catch (err) {
-      showInlineError(els['commit-error'], err.message || String(err));
+      if (!isCurrent()) return;
+      const error = err.message || String(err);
+      if (state.activeModal === 'commit-modal') showInlineError(els['commit-error'], error);
+      else toast(error, 'error');
     } finally {
       btn.disabled = false; btn.textContent = oldText;
     }
   }
 
-  async function handleGitHubSearch(e) {
+  async function commitGitHubFiles({ owner, repo, branch, headSha, baseTreeSha }, message, snapshot, isCurrent) {
+    const latestRef = await github.getRef(owner, repo, branch);
+    if (!isCurrent()) return;
+    if (latestRef.object.sha !== headSha) throw new Error('The branch changed on GitHub after you opened it. Reload the project before committing so you do not overwrite somebody else’s work.');
+    const treeEntries = [];
+    for (const [path, { type, mode, bytes }] of snapshot) {
+      const sha = type === 'delete' ? null : (await github.createBlob(owner, repo, bytes)).sha;
+      if (!isCurrent()) return;
+      treeEntries.push({ path, mode, type: 'blob', sha });
+    }
+    const tree = await github.createTree(owner, repo, baseTreeSha, treeEntries);
+    if (!isCurrent()) return;
+    const commit = await github.createCommit(owner, repo, message, tree.sha, headSha);
+    if (!isCurrent()) return;
+    await github.updateRef(owner, repo, branch, commit.sha);
+    return { sha: commit.sha, treeSha: tree.sha, treeEntries };
+  }
+
+  function acceptCommittedFiles(treeEntries, snapshot) {
+    // Rebase the working files on the pushed snapshot. Edits made during the
+    // requests stay local, including any still pending in the Monaco model.
+    for (const { path, mode, sha } of treeEntries) {
+      const meta = state.fileIndex.get(path);
+      const present = meta && !state.deletedPaths.has(path);
+      const pending = present && state.editorSyncPending && state.editorSyncPath === path;
+      const bytes = snapshot.get(path).bytes;
+      if (sha === null) {
+        state.originalBytes.delete(path);
+        state.deletedPaths.delete(path);
+        if (present) state.fileIndex.set(path, { path, mode, type: 'blob', size: meta.size, existing: false });
+        else {
+          state.fileIndex.delete(path);
+          state.fileBytes.delete(path);
+          state.sourceTextCache.delete(path);
+        }
+      } else {
+        state.fileIndex.set(path, { path, mode, type: 'blob', sha, size: bytes.length, existing: true });
+        state.originalBytes.set(path, bytes);
+        if (!present) state.deletedPaths.add(path);
+      }
+
+      const workingBytes = state.fileBytes.get(path);
+      if (present && (pending || !sameBytes(workingBytes, bytes))) {
+        const type = sha === null ? 'add' : 'modify';
+        state.changes.set(path, pending ? { type, pending: true } : { type, bytes: workingBytes });
+      } else if (!present && sha !== null) state.changes.set(path, { type: 'delete' });
+      else state.changes.delete(path);
+      updateFileTreeDirtyIndicator(path);
+    }
+    els['file-count-label'].textContent = `${effectivePaths().length} files`;
+    updateChangeUI();
+  }
+
+  let repoSearchRequest = 0;
+
+  async function handleRepoSearch(e) {
     e.preventDefault();
+    const request = ++repoSearchRequest;
+    const provider = els['repo-search-provider'].value;
     const query = els['github-search-input'].value;
     const target = els['github-search-results'];
-    target.innerHTML = '<div class="project-card"><span class="owner">Searching GitHub…</span></div>';
+    const label = repositoryProviderLabel(provider);
+    target.innerHTML = `<div class="project-card"><span class="owner">Searching ${label}…</span></div>`;
     try {
-      const results = await github.searchRepos(query);
-      renderSearchResults(results);
+      const client = provider === 'codeberg' ? await ensureCodebergClient() : repositoryClient(provider);
+      if (request !== repoSearchRequest) return;
+      const results = await client.searchRepos(query);
+      if (request === repoSearchRequest) renderSearchResults(results, provider);
     } catch (err) {
+      if (request !== repoSearchRequest) return;
       target.innerHTML = `<div class="empty-state"><h3>Search failed</h3><p>${escapeHtml(err.message)}</p></div>`;
     }
   }
-  function renderSearchResults(repos) {
+  function renderSearchResults(repos, provider) {
     const target = els['github-search-results']; target.innerHTML = '';
     if (!repos.length) { target.innerHTML = '<div class="empty-state"><h3>No repositories found</h3><p>Try a different repository name.</p></div>'; return; }
     for (const r of repos) {
-      const card = document.createElement('article'); card.className = 'project-card';
+      const card = document.createElement('a'); card.className = 'project-card';
+      card.href = repoHash(provider, r.owner.login, r.name);
       card.innerHTML = `<div><div class="project-card-top"><div class="project-card-icon">T</div>${r.private ? '<span class="private-chip">private</span>' : ''}</div><h3>${escapeHtml(r.name)}</h3><div class="owner">${escapeHtml(r.owner.login)}</div></div><div class="project-card-bottom"><span>${escapeHtml(r.language || 'Repository')}</span><span>${escapeHtml(r.default_branch || 'main')}</span></div>`;
-      card.addEventListener('click', () => location.hash = `#/repo/${encodeURIComponent(r.owner.login)}/${encodeURIComponent(r.name)}`);
       target.appendChild(card);
     }
   }
@@ -3362,8 +3772,9 @@
   }
   function addRecentProject() {
     if (!state.repo) return;
-    let recents = getRecents().filter(r => r.full_name !== state.repo.full_name);
-    recents.unshift({ full_name:state.repo.full_name, owner:state.repo.owner.login, name:state.repo.name, branch:state.branch, private:Boolean(state.repo.private), openedAt:new Date().toISOString() });
+    const provider = state.provider;
+    const recents = getRecents().filter(r => r.full_name !== state.repo.full_name || (r.provider || 'github') !== provider);
+    recents.unshift({ provider, full_name:state.repo.full_name, owner:state.repo.owner.login, name:state.repo.name, branch:state.branch, private:Boolean(state.repo.private), openedAt:new Date().toISOString() });
     localStorage.setItem(STORAGE.recents, JSON.stringify(recents.slice(0,12)));
     renderRecents();
   }
@@ -3374,40 +3785,84 @@
     els['recent-projects'].innerHTML = '';
     els['recent-empty'].classList.toggle('hidden', recents.length > 0);
     for (const r of recents) {
+      const provider = r.provider || 'github';
+      const providerLabel = repositoryProviderLabel(provider);
       const card = document.createElement('article'); card.className = 'project-card';
-      card.innerHTML = `<div><div class="project-card-top"><div class="project-card-icon">T</div><button class="project-remove" title="Remove from recents">×</button></div><h3>${escapeHtml(r.name)}</h3><div class="owner">${escapeHtml(r.owner)}</div></div><div class="project-card-bottom"><span>${escapeHtml(r.branch || 'main')}</span><span>${timeAgo(r.openedAt)}</span></div>`;
-      card.addEventListener('click', () => location.hash = `#/repo/${encodeURIComponent(r.owner)}/${encodeURIComponent(r.name)}${r.branch ? `?branch=${encodeURIComponent(r.branch)}` : ''}`);
+      card.innerHTML = `<div><div class="project-card-top"><div class="project-card-icon">T</div><button class="project-remove" title="Remove from recents">×</button></div><h3>${escapeHtml(r.name)}</h3><div class="owner">${escapeHtml(r.owner)} · ${providerLabel}</div></div><div class="project-card-bottom"><span>${escapeHtml(r.branch || 'main')}</span><span>${timeAgo(r.openedAt)}</span></div>`;
+      card.addEventListener('click', () => location.hash = repoHash(provider, r.owner, r.name, r.branch));
       card.querySelector('.project-remove').addEventListener('click', e => {
         e.stopPropagation();
-        const next = getRecents().filter(x => x.full_name !== r.full_name);
+        const next = getRecents().filter(x => x.full_name !== r.full_name || (x.provider || 'github') !== provider);
         localStorage.setItem(STORAGE.recents, JSON.stringify(next)); renderRecents();
       });
       els['recent-projects'].appendChild(card);
     }
   }
 
-  function openAuthModal() {
-    els['github-token-input'].value = '';
+  function openAuthModal(provider = state.provider) {
+    state.authProvider = provider;
+    state.authAttempt++;
+    const codeberg = provider === 'codeberg';
+    const input = els['github-token-input'];
+    input.value = '';
+    input.placeholder = codeberg ? 'Codeberg access token' : 'github_pat_…';
+    els['auth-modal-title'].textContent = `Connect ${repositoryProviderLabel(provider)}`;
+    els['auth-token-copy'].textContent = codeberg
+      ? 'Use a personal access token with write:repository to edit projects. The token goes directly to the Codeberg API.'
+      : 'Use a fine-grained personal access token with Contents: Read and write access to the repositories you want to edit. The token goes directly to the GitHub API.';
+    els['auth-token-help'].textContent = codeberg
+      ? 'Open Codeberg → Settings → Applications → Manage Access Tokens. To use a token limited to specific repositories, open its repository URL in the editor first. Account lookup and listing your repositories use read:user.'
+      : 'GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens. Give it access only to the repos your group edits.';
     els['auth-error'].classList.add('hidden');
-    els['disconnect-github-btn'].classList.toggle('hidden', !state.token);
+    els['disconnect-github-btn'].classList.toggle('hidden', !repositoryToken(provider));
+    const btn = els['save-github-token-btn'];
+    btn.disabled = false;
+    btn.textContent = 'Connect';
     openModal('auth-modal');
-    setTimeout(() => els['github-token-input'].focus(), 40);
+    setTimeout(() => { if (state.activeModal === 'auth-modal') input.focus(); }, 40);
   }
-  async function connectGitHub() {
+  async function connectRepositoryAccount() {
+    const provider = state.authProvider;
+    const label = repositoryProviderLabel(provider);
     const token = els['github-token-input'].value.trim();
-    if (!token) return showInlineError(els['auth-error'],'Paste a GitHub personal access token.');
-    const oldToken = state.token;
-    state.token = token;
-    const btn = els['save-github-token-btn']; btn.disabled = true; btn.textContent = 'Checking…';
+    if (!token) return showInlineError(els['auth-error'], `Paste a ${label} personal access token.`);
+    const btn = els['save-github-token-btn'];
+    if (btn.disabled) return;
+    const remember = els['remember-token-checkbox'].checked;
+    const attempt = ++state.authAttempt;
+    const isCurrent = () => attempt === state.authAttempt && state.activeModal === 'auth-modal';
+    const locationAtStart = location.hash;
+    btn.disabled = true;
+    btn.textContent = 'Checking…';
+    els['auth-error'].classList.add('hidden');
     try {
-      const profile = await github.getProfile();
-      saveToken(token, els['remember-token-checkbox'].checked);
-      state.profile = profile;
-      updateAccountUI(); closeModal(); toast(`Connected as ${profile.login}.`, 'success');
+      const client = provider === 'codeberg' ? await ensureCodebergClient() : repositoryClient(provider);
+      if (!isCurrent()) return;
+      let profile;
+      try {
+        profile = await client.getProfile(token);
+      } catch (error) {
+        if (!isCurrent()) return;
+        if (provider !== 'codeberg' || error.status !== 403) throw error;
+        const project = parseHash();
+        if (location.hash !== locationAtStart || project.provider !== provider) {
+          throw new Error('Open the Codeberg repository before connecting a repository-scoped token.');
+        }
+        await client.getRepo(project.owner, project.repo, token);
+      }
+      if (!isCurrent()) return;
+      saveToken(token, remember, provider);
+      if (provider === 'codeberg') state.codebergProfile = profile || null;
+      else state.profile = profile;
+      updateAccountUI();
+      closeModal();
+      toast(profile?.login ? `Connected to ${label} as ${profile.login}.` : `Connected to ${label} for this repository.`, 'success');
+      if (location.hash === locationAtStart && parseHash().provider === provider && !state.headSha) route();
     } catch (err) {
-      state.token = oldToken;
-      showInlineError(els['auth-error'], `GitHub rejected this token: ${err.message}`);
-    } finally { btn.disabled = false; btn.textContent = 'Connect'; }
+      if (isCurrent()) showInlineError(els['auth-error'], `Could not connect to ${label}. ${err.message}`);
+    } finally {
+      if (attempt === state.authAttempt) { btn.disabled = false; btn.textContent = 'Connect'; }
+    }
   }
 
   function openModal(id) {
@@ -3479,7 +3934,7 @@
     if (err?.name === 'AbortError') return;
     console.error(err);
     setCompileStatus('error','Could not open repository');
-    toast(err.status === 404 ? 'Repository not found or your GitHub token cannot access it.' : err.message, 'error', 6500);
+    toast(err.status === 404 ? `Repository not found or your ${repositoryProviderLabel()} token cannot access it.` : err.message, 'error', 6500);
     els['preview-loading'].classList.add('hidden');
     els['preview-error'].classList.remove('hidden');
     els['diagnostic-summary'].textContent = 'Could not open repository';
