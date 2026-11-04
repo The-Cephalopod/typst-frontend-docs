@@ -44,12 +44,14 @@ function harness() {
       },
       querySelector(selector) { return selector === 'svg' && this.innerHTML.includes('<svg') ? {} : null; },
       querySelectorAll: () => [],
+      setAttribute(name, value) { this[name] = value; },
     };
   };
   let source = fs.readFileSync(appPath, 'utf8');
   source = source.replace(/  boot\(\)\.catch\(err => \{[\s\S]*?\n  \}\);\n\}\)\(\);\s*$/, `
-  globalThis.appTest = { state, els, onEditorChanged, scheduleCompile, compilePreview, compilePreviewOnce,
+  globalThis.appTest = { state, els, onEditorChanged, scheduleCompile, compilePreview, compilePreviewOnce, exportPdf,
     createWorkerTypstRuntime, ensureTypstRuntime, route,
+    setGrammarEnabled,
     hooks(h) {
       if (h.compilePreview) compilePreview = h.compilePreview;
       if (h.compilePreviewOnce) compilePreviewOnce = h.compilePreviewOnce;
@@ -85,7 +87,7 @@ function harness() {
   const app = context.appTest;
   for (const name of ['editor-view', 'home-view', 'preview-output', 'preview-loading', 'preview-error',
     'diagnostic-list', 'preview-error-text', 'download-pdf-btn', 'compile-status', 'commit-btn',
-    'change-count-badge', 'tab-dirty-dot']) app.els[name] = element();
+    'change-count-badge', 'tab-dirty-dot', 'grammar-toggle-btn', 'editor-container']) app.els[name] = element();
   app.state.mainPath = app.state.openPath = 'main.typ';
   app.state.repo = { owner: { login: 'fixture' }, name: 'project' };
   app.state.fileIndex.set('main.typ', { existing: true, size: 7, sha: 'main' });
@@ -215,6 +217,81 @@ async function changedMainFileAndRouteCannotPublishOldOutput() {
   }
 }
 
+async function stalePdfExportCannotUpdateAnotherProject() {
+  const h = harness(), pdf = deferred();
+  let requestedPath;
+  h.window.$typst = { pdf: options => { requestedPath = options.mainFilePath; return pdf.promise; } };
+  const exporting = h.app.exportPdf();
+  await ticks();
+  assert.equal(requestedPath, '/repo/main.typ');
+  h.app.state.repositoryLoadSerial++;
+  h.app.state.mainPath = 'other.typ';
+  pdf.resolve(new Uint8Array());
+  await exporting;
+  assert.deepEqual(h.statuses.map(status => status.text), ['Exporting PDF']);
+}
+
+async function grammarChecksCoalesceAndNeverOfferStaleEdits() {
+  const h = harness();
+  const { state, els, onEditorChanged, setGrammarEnabled } = h.app;
+  h.app.hooks({ compilePreview: async () => {} });
+  let version = 1, reads = 0, provider;
+  const model = {
+    uri: 'file:///main.typ', getVersionId: () => version,
+    getValue: () => { reads++; return 'This is is a test.'; },
+    getPositionAt: offset => ({ lineNumber: 1, column: offset + 1 }),
+    getOffsetAt: position => position.column - 1,
+  };
+  const markers = [];
+  state.editor.getModel = () => model;
+  state.monaco = {
+    MarkerSeverity: { Info: 2 },
+    editor: { setModelMarkers: (_, owner, values) => markers.push({ owner, values }) },
+    languages: { registerCodeActionProvider: (_, value) => {
+      provider = value;
+      return { dispose: () => { provider = null; } };
+    } },
+  };
+  onEditorChanged({});
+  await h.advance(300);
+  assert.equal(h.workers.length, 0);
+  assert.equal(reads, 0);
+  assert.equal(provider, undefined);
+  setGrammarEnabled(true);
+  await h.advance(300);
+  const [worker] = h.workers;
+  assert.equal(els['grammar-toggle-btn']['aria-pressed'], 'true');
+  assert.equal(worker.url.pathname, '/app/grammar-worker.js');
+  const first = worker.posts[0][0];
+
+  version++;
+  onEditorChanged({});
+  await h.advance(150);
+  version++;
+  onEditorChanged({});
+  await h.advance(300);
+  assert.equal(worker.posts.length, 1, 'Only one check runs while subsequent edits coalesce.');
+  const diagnostics = [{ start: 7, end: 10, message: 'Repeated word.', replacement: '' }];
+  worker.onmessage({ data: { id: first.id, diagnostics } });
+  assert.equal(markers.length, 0, 'The result was for an older model version.');
+  const latest = worker.posts[1][0];
+  worker.onmessage({ data: { id: latest.id, diagnostics } });
+  assert.equal(markers[0].owner, 'grammar');
+  assert.equal(markers[0].values[0].startColumn, 8);
+
+  const range = { startLineNumber: 1, startColumn: 9, endLineNumber: 1, endColumn: 9 };
+  const [action] = provider.provideCodeActions(model, range).actions;
+  assert.equal(action.edit.edits[0].versionId, version);
+  assert.equal(action.edit.edits[0].textEdit.text, '');
+  version++;
+  assert.equal(provider.provideCodeActions(model, range).actions.length, 0);
+  setGrammarEnabled(false);
+  assert.equal(els['grammar-toggle-btn']['aria-pressed'], 'false');
+  assert.equal(markers.at(-1).values.length, 0);
+  assert.equal(worker.terminated, true);
+  assert.equal(provider, null);
+}
+
 async function latestInvalidSyntaxKeepsTheLastGoodPreviewAndShowsDiagnostics() {
   const h = harness();
   h.app.els['preview-output'].innerHTML = '<svg id="last-good"></svg>';
@@ -239,6 +316,23 @@ async function supersededSyntaxErrorsDoNotReplaceLatestDiagnostics() {
   await running;
   assert.equal(h.diagnostics.length, 0, 'An incomplete older snapshot must not flash stale diagnostics while typing.');
   assert.equal(h.app.els['preview-output'].innerHTML, '<svg id="last-good"></svg>');
+}
+
+async function supersededWarningsDoNotPublishWithValidPreview() {
+  const h = harness(), result = deferred();
+  h.app.hooks({ compileVectorWithDiagnostics: () => result.promise });
+  const running = h.app.compilePreviewOnce();
+  await ticks();
+  h.app.onEditorChanged({});
+  result.resolve({ svg: '<svg id="snapshot"></svg>', diagnostics: [{ severity: 'warning', message: 'outdated warning' }] });
+  await running;
+  assert.equal(h.app.els['preview-output'].innerHTML, '<svg id="snapshot"></svg>');
+  assert.equal(h.diagnostics.length, 0, 'Do not mark newer source with warnings from an older preview.');
+  h.app.hooks({ compileVectorWithDiagnostics: async () => ({
+    svg: '<svg id="latest"></svg>', diagnostics: [{ severity: 'warning', message: 'current warning' }],
+  }) });
+  await h.app.compilePreviewOnce();
+  assert.equal(h.app.state.diagnostics[0].message, 'current warning');
 }
 
 async function workerClientClonesBuffersAndCleansUpErrors() {
@@ -370,8 +464,10 @@ async function workerPageDeltasUseReceivedSnapshotsAndRecoverAfterReset() {
   const tests = [continuousInputKeepsFirstFrameDeadline, keystrokesNeverReadOrCompileTheWholeDocument,
     unavailableWorkersNeverLoadTheCompilerOnTheInputThread,
     queuedCompilesCoalesceToTheLatestRevisionWithoutOverlap, completedValidSnapshotsPublishWhileTypingContinues,
-    dataEditsAlsoRequestAPreview, changedMainFileAndRouteCannotPublishOldOutput,
+    dataEditsAlsoRequestAPreview, changedMainFileAndRouteCannotPublishOldOutput, stalePdfExportCannotUpdateAnotherProject,
+    grammarChecksCoalesceAndNeverOfferStaleEdits,
     latestInvalidSyntaxKeepsTheLastGoodPreviewAndShowsDiagnostics, supersededSyntaxErrorsDoNotReplaceLatestDiagnostics,
+    supersededWarningsDoNotPublishWithValidPreview,
     workerClientClonesBuffersAndCleansUpErrors, failedWorkerInitializationNeverBlocksTheEditorAndCanRetry,
     failedCompileStillProcessesNewerQueuedEdit, persistentFailureOfOneRevisionDoesNotLoop, workerPageDeltasUseReceivedSnapshotsAndRecoverAfterReset];
   for (const test of tests) { await test(); console.log(`PASS ${test.name}`); }

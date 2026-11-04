@@ -60,9 +60,12 @@ function emptyPagesAndMalformedFallback() {
   assert(parts);
   assert.equal(parts.pages[0], '<g class="typst-page"/>');
   assert.equal(join(parts), svg);
+  const spaced = opening + '<g class="typst-page"><path data-note="a > b" /></g \t\n></svg >';
+  assert.equal(join(split(spaced)), spaced, 'Whitespace before a closing delimiter must preserve the original markup.');
   for (const malformed of [
     '', null, '<svg><g/></svg>',
     opening + '<g class="typst-page"><path></g></svg>',
+    opening + '<g class="typst-page"></g unexpected></svg>',
     opening + '<g class="typst-page" data-value="unclosed></g></svg>',
     opening + '<g class="typst-page">unclosed',
     opening + page('one') + '<!-- unclosed</svg>',

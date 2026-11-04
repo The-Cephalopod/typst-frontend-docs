@@ -6,11 +6,13 @@ Run from the repository root with Node.js 18 or later. No dependencies or build 
 node --test tests/*.test.cjs
 node --check app.js
 node --check typst-worker.js
+node --check grammar-worker.js
+node --check codeberg.js
 ```
 
 The tests evaluate the actual `app.js` in a Node VM with startup disabled, minimal DOM doubles and controlled GitHub, Monaco and Typst responses. They cover shared dependency startup, retries, bounded import discovery, cache isolation, overlapping editor/data loading and cancellation when routes change.
 
-These 48 behavior checks cover data loading, startup, editor synchronization, SVG transport, input scheduling and worker failures. They verify that keystrokes never read the entire editor or synchronously call the compiler, continuous input cannot postpone the 16 ms preview deadline, and a worker failure cannot enable compilation on the input thread.
+The behavior checks cover data loading, startup, editor synchronization, SVG transport, input scheduling, worker failures, local grammar checks, GitHub commits and the Codeberg API contract. They verify that keystrokes never read the entire editor or synchronously call the compiler, continuous input cannot postpone the 16 ms preview deadline, and a worker failure cannot enable compilation on the input thread.
 
 The VM checks do not execute CDN libraries, WebAssembly or browser rendering. The separate browser check does:
 
@@ -26,6 +28,8 @@ Alternatively set `BROWSER_CHANNEL=msedge` to use an installed Microsoft Edge. T
 The fixture is approximately 413 KB of Typst source producing 90 pages. The test records 40 typing samples and eight isolated-edit preview samples, then checks viewport mounting, unchanged-page reuse, scrolling, zoom, navigation in both directions, PDF export, syntax recovery, changing page counts and project reset.
 
 `browser-interactions.cjs` binds the application's real event handlers and clicks rendered text in a project with an included file. It checks that line 183 remains visible after deferred layout, repeated preview clicks preserve undo history, a real mouse click closes Find while its Escape tooltip is present, keyboard Escape still closes Find, and tooltips containing documentation links remain interactive. This catches viewport and hit-testing bugs that checking the selected text alone cannot detect.
+
+The interaction check also uses the keyboard to switch themes, verifies that both theme buttons reflect the same preference after reload, and checks that switching themes preserves the Monaco model, selection and undo history without scheduling a compile.
 
 Optional environment variables:
 

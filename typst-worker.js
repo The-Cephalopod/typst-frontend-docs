@@ -60,6 +60,10 @@ function compileDocument(compiler, args, format = 0) {
 // Unexpected structure returns null so callers can retain full-SVG rendering.
 function splitSvgPages(svg) {
   if (typeof svg !== 'string') return null;
+  // Match at the tag offset so each glyph doesn't need a separate tag string.
+  const tagName = /[A-Za-z_][\w:.-]*/y;
+  const closingTail = /[^\s>]*\s*>/y;
+  const whitespace = /\s/;
   const stack = [];
   const ranges = [];
   let position = 0, openingEnd = -1, closingStart = -1, closingEnd = -1, pageStart = -1;
@@ -85,33 +89,42 @@ function splitSvgPages(svg) {
       continue;
     }
     if (svg.startsWith('<!', start)) return null;
-    let end = start + 1, quote = '';
+    let end = start + 1;
     for (; end < svg.length; end++) {
       const character = svg[end];
-      if (quote) { if (character === quote) quote = ''; }
-      else if (character === '"' || character === "'") quote = character;
-      else if (character === '>') break;
+      if (character === '>') break;
+      if (character === '"' || character === "'") {
+        end = svg.indexOf(character, end + 1);
+        if (end < 0) return null;
+      }
     }
     if (end === svg.length) return null;
-    const tag = svg.slice(start, end + 1);
-    const match = /^<\/?([A-Za-z_][\w:.-]*)/.exec(tag);
+    const closing = svg[start + 1] === '/';
+    tagName.lastIndex = start + (closing ? 2 : 1);
+    const match = tagName.exec(svg);
     if (!match) return null;
-    const name = match[1];
-    const closing = tag[1] === '/';
-    const selfClosing = /\/\s*>$/.test(tag);
+    const name = match[0];
+    const nameEnd = tagName.lastIndex;
     if (closing) {
-      if (!/^<\/[^\s>]+\s*>$/.test(tag) || stack.pop() !== name) return null;
+      if (nameEnd !== end) {
+        closingTail.lastIndex = nameEnd;
+        if (!closingTail.test(svg) || closingTail.lastIndex !== end + 1) return null;
+      }
+      if (stack.pop() !== name) return null;
       if (stack.length === 1 && pageStart >= 0) {
         ranges.push([pageStart, end + 1]);
         pageStart = -1;
       }
       if (stack.length === 0) { closingStart = start; closingEnd = end + 1; break; }
     } else {
+      let tail = end - 1;
+      while (whitespace.test(svg[tail])) tail--;
+      const selfClosing = svg[tail] === '/';
       if (stack.length === 0) {
         if (name !== 'svg' || openingEnd >= 0 || svg.slice(0, start).trim()) return null;
         openingEnd = end + 1;
       } else if (stack.length === 1 && name === 'g') {
-        const attributes = tag.slice(match[0].length, selfClosing ? -2 : -1);
+        const attributes = svg.slice(nameEnd, selfClosing ? end - 1 : end);
         let offset = 0, page = false;
         while (offset < attributes.length) {
           const attribute = /^\s+([A-Za-z_][\w:.-]*)\s*=\s*(["'])([\s\S]*?)\2/.exec(attributes.slice(offset));

@@ -1,4 +1,5 @@
 :root {
+  color-scheme: dark;
   --bg: #111214;
   --panel: #17181b;
   --panel-2: #1d1f23;
@@ -21,6 +22,7 @@
 }
 
 :root[data-theme="light"] {
+  color-scheme: light;
   --bg: #f5f6f7;
   --panel: #ffffff;
   --panel-2: #f3f4f6;
@@ -162,6 +164,9 @@ button, a { -webkit-tap-highlight-color: transparent; }
 }
 .hero .hero-hint { font-size: 12px; margin-top: 14px; color: var(--muted-2); }
 .projects-section { margin-top: 52px; }
+.repo-search-section > summary { cursor: pointer; font-weight: 700; }
+.repo-search-section[open] > summary { margin-bottom: 18px; }
+.repo-search-section a.project-card { color: inherit; text-decoration: none; }
 .section-heading-row { display: flex; align-items: end; justify-content: space-between; gap: 24px; margin-bottom: 20px; }
 .section-heading-row h2 { margin: 0; font-size: 21px; letter-spacing: -.02em; }
 .section-heading-row p { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
@@ -207,6 +212,7 @@ button, a { -webkit-tap-highlight-color: transparent; }
 }
 .editor-topbar-left, .editor-topbar-right { display: flex; align-items: center; min-width: 0; }
 .editor-topbar-right { justify-content: flex-end; gap: 6px; }
+#grammar-toggle-btn[aria-pressed="true"] { border-color: var(--accent); color: var(--accent-strong); }
 .editor-brand { width: 30px; height: 30px; font-size: 18px; text-decoration: none; border-radius: 7px; flex: 0 0 auto; }
 .repo-identity { display: flex; align-items: center; min-width: 0; margin-left: 10px; }
 .repo-title-btn { max-width: 330px; background: transparent; padding: 6px 4px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -379,7 +385,8 @@ button, a { -webkit-tap-highlight-color: transparent; }
 }
 @media (max-width: 680px) {
   body { overflow: auto; }
-  .home-topbar { padding: 0 16px; }
+  .home-topbar { height: auto; min-height: 72px; padding: 8px 16px; flex-wrap: wrap; gap: 8px; }
+  .topbar-actions { flex-wrap: wrap; }
   .home-main { width: min(100% - 28px, 1160px); padding-top: 54px; }
   .hero { margin-bottom: 64px; }
   .hero h1 { font-size: 46px; }

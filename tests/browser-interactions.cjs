@@ -11,7 +11,7 @@ const server = http.createServer((req, res) => {
   if (!file.startsWith(root + path.sep) || !fs.existsSync(file)) { res.writeHead(404).end(); return; }
   let body = fs.readFileSync(file);
   if (file.endsWith('app.js')) body = body.toString().replace(/  boot\(\)\.catch\(err => \{[\s\S]*?\n  \}\);\n\}\)\(\);\s*$/, `
-    cacheElements(); bindEvents();
+    cacheElements(); loadTheme(); bindEvents();
     window.testApp = { state, els, ensureMonaco, ensureTypstRuntime, compilePreview, openFile, openFileAtOffset,
       schedulePreviewSourceAnchorIndexing, settleEditorLayout };
   })();`);
@@ -30,7 +30,6 @@ const server = http.createServer((req, res) => {
     await page.goto(`http://127.0.0.1:${server.address().port}/`);
     console.log('Loaded local application');
     await page.evaluate(async () => {
-      document.documentElement.dataset.theme = 'dark';
       const { state, els, ensureMonaco, ensureTypstRuntime, openFile, compilePreview } = testApp;
       els['home-view'].classList.add('hidden'); els['editor-view'].classList.remove('hidden');
       await Promise.all([ensureMonaco(), ensureTypstRuntime()]);
@@ -84,7 +83,7 @@ const server = http.createServer((req, res) => {
       return same && editor.getValue() === originalText;
     }), 'Source navigation must preserve the current model and undo history.');
     console.log('PASS repeated preview navigation preserves undo history');
-    await page.keyboard.press('Control+f');
+    await page.keyboard.press('ControlOrMeta+f');
     const find = page.locator('.monaco-editor .find-widget');
     await find.waitFor({ state: 'visible' });
     const close = find.locator('.codicon-widget-close');
@@ -98,7 +97,7 @@ const server = http.createServer((req, res) => {
     assert.equal(await find.getAttribute('aria-hidden'), 'true', 'A real mouse click must close Find even after hover.');
     assert(await page.evaluate(() => testApp.state.editor.hasTextFocus()));
     console.log('PASS Find closes with the mouse after the Escape tooltip appears');
-    await page.keyboard.press('Control+f');
+    await page.keyboard.press('ControlOrMeta+f');
     await page.waitForFunction(() => document.querySelector('.find-widget').getAttribute('aria-hidden') === 'false');
     await page.keyboard.press('Escape');
     assert.equal(await find.getAttribute('aria-hidden'), 'true');
@@ -111,7 +110,54 @@ const server = http.createServer((req, res) => {
       const interactive = getComputedStyle(popup.querySelector('a')).pointerEvents !== 'none';
       popup.remove(); return interactive;
     }));
-    assert.deepEqual(errors, []);
     console.log('PASS Escape still closes Find and documentation links stay interactive');
+
+    await page.evaluate(() => {
+      const { editor } = testApp.state;
+      const model = editor.getModel();
+      editor.pushUndoStop();
+      window.beforeThemeEdit = model.getValue();
+      editor.executeEdits('test', [{ range: new monaco.Range(1, 1, 1, 1), text: '// theme test\n' }]);
+      editor.pushUndoStop();
+      editor.setSelection(new monaco.Selection(1, 4, 1, 9));
+    });
+    await page.waitForFunction(() => !testApp.state.compileTimer && !testApp.state.compileInFlight);
+    await page.evaluate(() => {
+      const { editor, compileSerial } = testApp.state;
+      const model = editor.getModel();
+      window.beforeTheme = { model, text: model.getValue(), selection: editor.getSelection(), compileSerial };
+    });
+    const theme = page.getByRole('button', { name: 'Light theme', exact: true });
+    const editorTheme = page.locator('#editor-view').getByRole('button', { name: 'Light theme', exact: true });
+    await editorTheme.focus();
+    await page.keyboard.press('Space');
+    assert.equal(await theme.getAttribute('aria-pressed'), 'true');
+    assert.equal(await page.locator('#home-theme-btn').getAttribute('aria-pressed'), 'true');
+    assert(await page.evaluate(() => {
+      const { editor, compileSerial } = testApp.state;
+      const { model, text, selection } = beforeTheme;
+      return document.documentElement.dataset.theme === 'light' &&
+        getComputedStyle(document.documentElement).colorScheme === 'light' &&
+        getComputedStyle(editor.getDomNode().querySelector('.monaco-editor-background')).backgroundColor === 'rgb(255, 255, 255)' &&
+        editor.getModel() === model && model.getValue() === text &&
+        editor.getSelection().equalsSelection(selection) && model.canUndo() &&
+        compileSerial === beforeTheme.compileSerial && !testApp.state.compileTimer;
+    }));
+    assert(await page.evaluate(() => {
+      const { editor } = testApp.state;
+      editor.trigger('test', 'undo', null);
+      return editor.getValue() === beforeThemeEdit;
+    }));
+    await page.waitForFunction(() => !testApp.state.changes.size && !testApp.state.compileInFlight);
+    await page.reload();
+    await page.waitForFunction(() => document.documentElement.dataset.theme === 'light');
+    assert.equal(await theme.getAttribute('aria-pressed'), 'true');
+    await theme.focus();
+    await page.keyboard.press('Enter');
+    assert.equal(await theme.getAttribute('aria-pressed'), 'false');
+    assert.equal(await page.locator('#editor-theme-btn').getAttribute('aria-pressed'), 'false');
+    assert.equal(await page.locator('html').getAttribute('data-theme'), 'dark');
+    assert.deepEqual(errors, []);
+    console.log('PASS keyboard theme toggles share the persisted preference and preserve the model, selection and undo without compiling');
   } finally { clearTimeout(timeout); await browser.close(); server.close(); }
 })().catch(error => { console.error(error); server.close(); process.exitCode = 1; });

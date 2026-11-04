@@ -32,9 +32,10 @@ function harness() {
   let source = fs.readFileSync(appPath, 'utf8');
   source = source.replace(/  boot\(\)\.catch\(err => \{[\s\S]*?\n  \}\);\n\}\)\(\);\s*$/, `
   globalThis.appTest = {
-    state, els, github, route, loadScript, ensureMonaco, ensureTypstRuntime,
+    state, els, github, route, parseHash, parseRepoInput, repoHash, onBranchChange, getRecents, addRecentProject,
+    loadScript, ensureMonaco, ensureTypstRuntime,
     openFile, openRepository, resetProjectState, hydrateCompilerFS, pooled,
-    compilePreviewOnce, compilePreview, showCompileError, handleFatalRepoError,
+    compilePreviewOnce, compilePreview, showCompileError, handleFatalRepoError, onEditorChanged,
     hooks(h) {
       if (h.initMonaco) initMonaco = h.initMonaco;
       if (h.createWorkerTypstRuntime) createWorkerTypstRuntime = h.createWorkerTypstRuntime;
@@ -61,12 +62,15 @@ function harness() {
   const document = {
     createElement: element,
     head: { appendChild: noop },
+    baseURI: 'https://fixture.test/editor/',
     documentElement: { dataset: { theme: 'dark' }, style: { setProperty: noop } },
   };
   const window = {};
   const location = { hash: '#/' };
+  const storage = new Map();
   const context = vm.createContext({
-    TextEncoder, TextDecoder, Uint8Array, Map, Set, WeakMap, URLSearchParams,
+    TextEncoder, TextDecoder, Uint8Array, Map, Set, WeakMap, URL, URLSearchParams,
+    localStorage: { getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value) },
     atob: value => Buffer.from(value, 'base64').toString('binary'),
     setTimeout, clearTimeout, cancelAnimationFrame: noop,
     window, document, location, console, Worker: function Worker() {},
@@ -76,7 +80,7 @@ function harness() {
   for (const name of ['home-view', 'editor-view', 'compile-status', 'repo-sync-status',
     'preview-output', 'preview-error', 'diagnostic-list', 'preview-error-text', 'preview-loading',
     'commit-btn', 'change-count-badge', 'tab-dirty-dot', 'main-file-label', 'file-count-label',
-    'status-current-file', 'tab-file-name', 'tab-file-icon', 'editor-container', 'binary-file-view']) {
+    'status-current-file', 'tab-file-name', 'tab-file-icon', 'editor-container', 'binary-file-view', 'branch-select']) {
     app.els[name] = element();
   }
   return { app, context, window, document, location };
@@ -232,6 +236,47 @@ async function runtimeWaitCannotHydrateAReplacementProject() {
   assert.equal(app.state.compilerHydrated, true);
 }
 
+async function dependencyDiscoveryOverlapsRuntimeStartup() {
+  const { app, window } = harness();
+  const runtime = deferred();
+  const operations = [];
+  app.hooks({ ensureTypstRuntime: () => runtime.promise });
+  window.$typst = {
+    resetShadow: async () => operations.push('reset'),
+    mapShadow: async path => { operations.push(path); return true; },
+  };
+  project(app, 'fixture');
+  app.state.fileIndex.set('fixture.typ', { existing: true, size: 21, sha: 'main' });
+  app.state.fileIndex.set('chapter.typ', { existing: true, size: 9, sha: 'chapter' });
+  app.github.getBlob = async (_owner, _repo, sha) => {
+    operations.push(`read:${sha}`);
+    const content = sha === 'main' ? '#include "chapter.typ"' : '= Chapter';
+    return { content: Buffer.from(content).toString('base64') };
+  };
+
+  const hydrating = app.hydrateCompilerFS();
+  await new Promise(setImmediate);
+  assert.deepEqual(operations, ['read:main', 'read:chapter']);
+  runtime.resolve();
+  await hydrating;
+  assert.deepEqual(operations, ['read:main', 'read:chapter', 'reset', '/repo/fixture.typ', '/repo/chapter.typ']);
+}
+
+async function editingDefersOffscreenPreviewUnmount() {
+  const { app } = harness();
+  let removed = 0;
+  const page = { navigationPinned: true, visible: false, group: {}, svg: { replaceChildren: () => removed++ } };
+  app.state.openPath = 'fixture.typ';
+  app.state.previewSvgCache = { pinnedPage: page };
+  app.onEditorChanged({});
+  clearTimeout(app.state.editorSyncTimer);
+  assert.equal(app.state.previewSvgCache.pinnedPage, null);
+  assert.equal(removed, 0);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(removed, 1);
+  assert.equal(page.group, null);
+}
+
 async function failedHydrationDrainsWorkersBeforeNextProject() {
   const { app, window } = harness();
   const secondOldMap = deferred();
@@ -342,12 +387,12 @@ async function repositoryAndEditorRequestsRunInParallel() {
   const { app } = harness();
   const editor = deferred();
   const metadata = deferred();
-  let metadataRequested = false, editorRequested = false;
+  let metadataRequested = false, editorRequested = false, hydrationStarted = false;
   app.hooks({
     ensureMonaco: () => { editorRequested = true; return editor.promise; },
     ensureTypstRuntime: async () => {},
     renderFileTree: noop, updateRepoHeader: noop, renderBranches: noop,
-    addRecentProject: noop, hydrateCompilerFS: async () => {}, scheduleCompile: noop,
+    addRecentProject: noop, hydrateCompilerFS: async () => { hydrationStarted = true; }, scheduleCompile: noop,
     applyDiagnosticMarkersForOpenFile: noop, settleEditorLayout: noop, updateFileTreeSelection: noop,
   });
   app.github.getRepo = () => { metadataRequested = true; return metadata.promise; };
@@ -362,11 +407,102 @@ async function repositoryAndEditorRequestsRunInParallel() {
   const opening = app.openRepository('fixture', 'project', null);
   assert(metadataRequested && editorRequested, 'GitHub metadata must not wait for Monaco startup.');
   metadata.resolve({ owner: { login: 'fixture' }, name: 'project', full_name: 'fixture/project', default_branch: 'main' });
-  await ticks();
+  await new Promise(setImmediate);
   assert.equal(values.length, 0, 'Opening must wait for editor readiness before setting source.');
+  assert.equal(hydrationStarted, true, 'Hydration can begin while the editor is loading.');
   editor.resolve();
   await opening;
   assert.equal(values[0], '= Ready');
+}
+
+async function providerRoutesPreserveLegacyLinksAndSeparateRecents() {
+  const { app, location, context } = harness();
+  const json = value => JSON.parse(JSON.stringify(value));
+  assert.deepEqual(json(app.parseRepoInput('owner/project')), { provider: 'github', owner: 'owner', repo: 'project' });
+  assert.deepEqual(json(app.parseRepoInput('https://github.com/owner/project.git')), { provider: 'github', owner: 'owner', repo: 'project' });
+  for (const url of ['https://codeberg.org/owner/project.git', 'codeberg.org/owner/project']) {
+    assert.deepEqual(json(app.parseRepoInput(url)), { provider: 'codeberg', owner: 'owner', repo: 'project' });
+  }
+  assert.throws(() => app.parseRepoInput('https://codeberg.org.example/owner/project'), /repository URL/);
+  location.hash = '#/repo/codeberg/project';
+  assert.equal(app.parseHash().provider, 'github', 'GitHub users named codeberg retain their old links.');
+  location.hash = app.repoHash('codeberg', 'owner', 'project', 'release/notes');
+  assert.equal(location.hash, '#/repo/codeberg/owner/project?branch=release%2Fnotes');
+  assert.deepEqual(json(app.parseHash()), { type: 'repo', provider: 'codeberg', owner: 'owner', repo: 'project', branch: 'release/notes' });
+
+  context.localStorage.setItem('typstgit.recents.v1', JSON.stringify([{ full_name: 'owner/project', owner: 'owner', name: 'project' }]));
+  app.state.repo = { full_name: 'owner/project', owner: { login: 'owner' }, name: 'project' };
+  app.state.provider = 'codeberg';
+  app.state.branch = 'release/notes';
+  app.addRecentProject();
+  assert.deepEqual(Array.from(app.getRecents(), recent => recent.provider), ['codeberg', undefined]);
+  app.state.provider = 'github';
+  app.addRecentProject();
+  assert.deepEqual(Array.from(app.getRecents(), recent => recent.provider), ['github', 'codeberg']);
+}
+
+async function codebergLoadsOnlyOnDemandAndCannotOpenAStaleRoute() {
+  const { app, window } = harness();
+  const script = deferred();
+  const order = [];
+  app.hooks({
+    ensureMonaco: async () => { order.push('Monaco'); },
+    ensureTypstRuntime: async () => { order.push('Typst'); },
+    loadScript: url => { order.push(url); return script.promise; },
+    showHome: noop,
+  });
+  app.route();
+  assert.deepEqual(order, []);
+  window.CodebergClient = class {
+    getRepo() { assert.fail('A stale provider load must not start repository requests.'); }
+  };
+  const opening = app.openRepository('owner', 'project', null, undefined, 'codeberg');
+  assert.deepEqual(order, ['Monaco', 'Typst', 'https://fixture.test/editor/codeberg.js']);
+  app.route();
+  script.resolve();
+  await opening;
+  assert.equal(app.state.repo, null);
+}
+
+async function codebergUsesItsOwnMetadataBranchAndBlobRequests() {
+  const { app, window, location } = harness();
+  app.hooks({
+    loadScript: async () => {},
+    ensureMonaco: async () => {},
+    ensureTypstRuntime: async () => {},
+    renderFileTree: noop, updateRepoHeader: noop, renderBranches: noop, hydrateCompilerFS: async () => {}, scheduleCompile: noop,
+    applyDiagnosticMarkersForOpenFile: noop, settleEditorLayout: noop, updateFileTreeSelection: noop,
+  });
+  const requests = [];
+  window.CodebergClient = class {
+    async getRepo(owner, repo) {
+      requests.push(['repo', owner, repo]);
+      return { owner: { login: owner }, name: repo, full_name: `${owner}/${repo}`, default_branch: 'trunk' };
+    }
+    async getBranches() { return [{ name: 'trunk' }, { name: 'release/notes' }]; }
+    async getRef(_owner, _repo, branch) { requests.push(['ref', branch]); return { object: { sha: 'commit' } }; }
+    async getCommit(_owner, _repo, sha) { requests.push(['commit', sha]); return { tree: { sha: 'tree' } }; }
+    async getTree(_owner, _repo, sha) {
+      requests.push(['tree', sha]);
+      return { tree: [{ path: 'main.typ', type: 'blob', sha: 'blob', size: 11 }] };
+    }
+    async getBlob(_owner, _repo, sha) {
+      requests.push(['blob', sha]);
+      return { content: Buffer.from('= Codeberg').toString('base64') };
+    }
+  };
+  app.github.getRepo = () => assert.fail('A Codeberg route must not contact GitHub.');
+  const values = [];
+  app.state.editor = { setValue: value => values.push(value), getModel: () => ({}), focus: noop };
+  app.state.monaco = { editor: { setModelLanguage: noop } };
+  await app.openRepository('owner', 'project', 'trunk', undefined, 'codeberg');
+  assert.deepEqual(requests, [['repo', 'owner', 'project'], ['ref', 'trunk'], ['commit', 'commit'], ['tree', 'tree'], ['blob', 'blob']]);
+  assert.deepEqual(values, ['= Codeberg']);
+  assert.equal(app.els['repo-sync-status'].textContent, 'Codeberg • trunk');
+  assert.equal(app.getRecents()[0].provider, 'codeberg');
+  app.els['branch-select'].value = 'release/notes';
+  await app.onBranchChange();
+  assert.equal(location.hash, '#/repo/codeberg/owner/project?branch=release%2Fnotes');
 }
 
 (async () => {
@@ -374,10 +510,13 @@ async function repositoryAndEditorRequestsRunInParallel() {
     runtimeStartupSharesAndRetries, scriptFailuresAreRetryable,
     staleMetadataCannotOverwriteRoute, staleEditorStartupCannotWriteNewProject,
     returningHomeCancelsPendingEditorAndCompileWork,
-    runtimeWaitCannotHydrateAReplacementProject, failedHydrationDrainsWorkersBeforeNextProject,
+    runtimeWaitCannotHydrateAReplacementProject, dependencyDiscoveryOverlapsRuntimeStartup,
+    editingDefersOffscreenPreviewUnmount, failedHydrationDrainsWorkersBeforeNextProject,
     staleHydrationCannotStartCompilation, staleCancellationsDoNotBecomeErrors,
     staleCompileCleanupDoesNotEraseNewCompile,
-    loadedDefaultBranchDoesNotReload, repositoryAndEditorRequestsRunInParallel];
+    loadedDefaultBranchDoesNotReload, repositoryAndEditorRequestsRunInParallel,
+    providerRoutesPreserveLegacyLinksAndSeparateRecents,
+    codebergLoadsOnlyOnDemandAndCannotOpenAStaleRoute, codebergUsesItsOwnMetadataBranchAndBlobRequests];
   for (const test of tests) {
     await test();
     console.log(`PASS ${test.name}`);

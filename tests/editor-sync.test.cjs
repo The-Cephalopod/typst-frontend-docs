@@ -18,20 +18,32 @@ function deferred() {
 function harness() {
   let source = fs.readFileSync(appPath, 'utf8');
   source = source.replace(/  boot\(\)\.catch\(err => \{[\s\S]*?\n  \}\);\n\}\)\(\);\s*$/, `
-  globalThis.appTest = { state, els, syncOpenFileFromEditor, flushEditorSync, resetProjectState };
+  const testUI = { closed: 0, toasts: [] };
+  globalThis.appTest = {
+    state, els, github, testUI, syncOpenFileFromEditor, flushEditorSync, resetProjectState, commitChanges, openDiagnosticLocation,
+    route, createNewFile, renameSelectedFile, uploadFiles,
+    mockOpenFile: fn => { openFile = fn; },
+    mockTextPrompt: fn => { textPrompt = fn; },
+  };
   updateChangeUI = () => {};
   updateFileTreeDirtyIndicator = () => {};
+  renderFileTree = () => {};
+  scheduleCompile = () => {};
+  closeModal = () => { testUI.closed++; state.activeModal = null; };
+  toast = message => testUI.toasts.push(message);
+  showHome = () => {};
 })();`);
   assert(source.includes('globalThis.appTest'), 'Test instrumentation must disable application boot.');
   const window = {};
   const context = vm.createContext({
     TextEncoder, TextDecoder, Uint8Array, Map, Set, WeakMap, URLSearchParams,
-    setTimeout, clearTimeout, console, window, document: {},
+    setTimeout, clearTimeout, console, window, document: {}, location: { hash: '#/' },
   });
   vm.runInContext(source, context, { filename: appPath });
   const app = context.appTest;
-  for (const name of ['preview-output', 'preview-error', 'diagnostic-list', 'preview-error-text', 'preview-loading']) {
-    app.els[name] = { innerHTML: '', classList: { add: noop, remove: noop } };
+  for (const name of ['preview-output', 'preview-error', 'diagnostic-list', 'preview-error-text', 'preview-loading',
+    'commit-message-input', 'commit-error', 'confirm-commit-btn', 'file-count-label', 'editor-container', 'main-file-label']) {
+    app.els[name] = { innerHTML: '', classList: { add: noop, remove: noop, contains: () => false } };
   }
   let currentText = '';
   app.state.editor = { getValue: () => currentText };
@@ -178,4 +190,245 @@ test('a mismatched editor path aborts rather than reading a different file or lo
   app.state.openPath = 'other.typ';
   await assert.rejects(app.flushEditorSync(), error => error.name === 'AbortError');
   assert.equal(app.state.fileBytes.size, 0);
+});
+
+function commitHarness() {
+  const h = harness();
+  const { app } = h;
+  const { state, els, github } = app;
+  const calls = [];
+  Object.assign(state, {
+    repo: { owner: { login: 'fixture' }, name: 'project' }, branch: 'main',
+    headSha: 'base-commit', baseTreeSha: 'base-tree', activeModal: 'commit-modal',
+  });
+  state.originalBytes.set('main.typ', new TextEncoder().encode('base document'));
+  els['commit-message-input'].value = 'Update document';
+  github.getRef = async (owner, repo, branch) => {
+    calls.push(['ref', owner, repo, branch]);
+    return { object: { sha: 'base-commit' } };
+  };
+  github.createBlob = async (owner, repo, bytes) => {
+    calls.push(['blob', owner, repo, Buffer.from(bytes).toString()]);
+    return { sha: 'pushed-blob' };
+  };
+  github.createTree = async (owner, repo, tree, entries) => {
+    calls.push(['tree', owner, repo, tree, JSON.parse(JSON.stringify(entries))]);
+    return { sha: 'pushed-tree' };
+  };
+  github.createCommit = async (...args) => {
+    calls.push(['commit', ...args]);
+    return { sha: 'pushed-commit' };
+  };
+  github.updateRef = async (...args) => { calls.push(['push', ...args]); };
+  h.edit('submitted document');
+  return { ...h, calls };
+}
+
+test('successful commits preserve edits made after the submitted snapshot', async () => {
+  const { app, edit, calls } = commitHarness();
+  const { state, github, testUI } = app;
+  const patch = deferred();
+  const originalUpdateRef = github.updateRef;
+  github.updateRef = async (...args) => {
+    await originalUpdateRef(...args);
+    await patch.promise;
+  };
+  state.fileIndex.set('removed.typ', { path: 'removed.typ', existing: true });
+  state.deletedPaths.add('removed.typ');
+  state.changes.set('removed.typ', { type: 'delete' });
+  const commit = app.commitChanges();
+  await nextTurn();
+  assert.deepEqual(calls, [
+    ['ref', 'fixture', 'project', 'main'],
+    ['blob', 'fixture', 'project', 'submitted document'],
+    ['tree', 'fixture', 'project', 'base-tree', [
+      { path: 'removed.typ', mode: '100644', type: 'blob', sha: null },
+      { path: 'main.typ', mode: '100644', type: 'blob', sha: 'pushed-blob' },
+    ]],
+    ['commit', 'fixture', 'project', 'Update document', 'pushed-tree', 'base-commit'],
+    ['push', 'fixture', 'project', 'main', 'pushed-commit'],
+  ]);
+  edit('newer local document');
+  patch.resolve();
+  await commit;
+  assert.equal(state.headSha, 'pushed-commit');
+  assert.equal(state.baseTreeSha, 'pushed-tree');
+  assert.equal(state.fileIndex.get('main.typ').sha, 'pushed-blob');
+  assert.equal(state.fileIndex.has('removed.typ'), false);
+  assert.equal(state.changes.has('removed.typ'), false);
+  assert.equal(state.editor.getValue(), 'newer local document');
+  assert.equal(state.changes.get('main.typ').pending, true);
+  assert.equal(Buffer.from(state.originalBytes.get('main.typ')).toString(), 'submitted document');
+  await app.flushEditorSync();
+  assert.equal(Buffer.from(state.changes.get('main.typ').bytes).toString(), 'newer local document');
+  assert.equal(testUI.closed, 1);
+  assert.match(testUI.toasts[0], /Committed 2 changes to main/);
+});
+
+test('a rejected push preserves the working copy, including when the branch moved', async () => {
+  const { app, calls } = commitHarness();
+  const { state, els, github } = app;
+  const getRef = github.getRef;
+  github.getRef = async () => ({ object: { sha: 'remote-commit' } });
+  await app.commitChanges();
+  assert.match(els['commit-error'].textContent, /branch changed on GitHub/);
+  assert.deepEqual(calls, []);
+
+  github.getRef = getRef;
+  github.updateRef = async () => { throw new Error('Non-fast-forward update'); };
+  await app.commitChanges();
+  assert.match(els['commit-error'].textContent, /Non-fast-forward update/);
+  assert.equal(state.headSha, 'base-commit');
+  assert.equal(state.baseTreeSha, 'base-tree');
+  assert.equal(state.activeModal, 'commit-modal');
+  assert.equal(Buffer.from(state.changes.get('main.typ').bytes).toString(), 'submitted document');
+  assert.equal(els['confirm-commit-btn'].disabled, false);
+});
+
+test('a delayed GitHub response cannot push to or update a newly opened branch', async () => {
+  const { app, calls } = commitHarness();
+  const { state, github, testUI } = app;
+  const blob = deferred();
+  const createBlob = github.createBlob;
+  github.createBlob = async (...args) => { await createBlob(...args); return blob.promise; };
+  const commit = app.commitChanges();
+  await nextTurn();
+  assert.deepEqual(calls.map(([name]) => name), ['ref', 'blob']);
+  state.repositoryLoadSerial++;
+  app.resetProjectState();
+  state.branch = 'other';
+  state.headSha = 'other-commit';
+  state.activeModal = 'auth-modal';
+  blob.resolve({ sha: 'old-blob' });
+  await commit;
+  assert.deepEqual(calls.map(([name]) => name), ['ref', 'blob']);
+  assert.equal(state.headSha, 'other-commit');
+  assert.equal(state.activeModal, 'auth-modal');
+  assert.equal(testUI.toasts.length, 0);
+});
+
+test('clicking a diagnostic in the open file selects its range without resetting the editor', async () => {
+  const { app } = harness();
+  const calls = [];
+  app.mockOpenFile(() => assert.fail('Reopening the current file would reset its undo history.'));
+  app.state.monaco = { editor: { ScrollType: { Smooth: 0 } } };
+  Object.assign(app.state.editor, {
+    getModel: () => ({ getLineCount: () => 10, getLineMaxColumn: () => 40 }),
+    setSelection: range => calls.push(JSON.parse(JSON.stringify(range))),
+    revealRangeInCenter: () => calls.push('reveal'),
+    focus: () => calls.push('focus'),
+  });
+  await app.openDiagnosticLocation({
+    path: 'main.typ',
+    range: { startLine: 5, startColumn: 12, endLine: 6, endColumn: 4 },
+  });
+  assert.deepEqual(calls, [
+    { startLineNumber: 6, startColumn: 12, endLineNumber: 7, endColumn: 4 }, 'reveal', 'focus',
+  ]);
+});
+
+test('a diagnostic awaiting a file open does not reveal its range in a different project', async () => {
+  const { app } = harness();
+  const open = deferred();
+  app.state.fileIndex.set('included.typ', { path: 'included.typ', existing: true });
+  app.mockOpenFile(() => open.promise);
+  app.state.editor.setSelection = () => assert.fail('Selection belongs to the previous project.');
+  const jump = app.openDiagnosticLocation({
+    path: 'included.typ', range: { startLine: 5, startColumn: 12, endLine: 5, endColumn: 13 },
+  });
+  app.state.repositoryLoadSerial++;
+  app.resetProjectState();
+  app.state.openPath = 'included.typ';
+  open.resolve();
+  await jump;
+});
+
+test('navigation closes file prompts and ignores a stale create or rename confirmation', async () => {
+  for (const action of ['createNewFile', 'renameSelectedFile']) {
+    const { app } = harness();
+    const prompt = deferred();
+    app.mockTextPrompt(() => {
+      app.state.activeModal = 'text-prompt-modal';
+      return prompt.promise;
+    });
+    const operation = app[action]();
+    await nextTurn();
+    assert.equal(app.state.activeModal, 'text-prompt-modal');
+    app.route();
+    assert.equal(app.testUI.closed, 1);
+    prompt.resolve('later.typ');
+    await operation;
+    assert.equal(app.state.changes.size, 0);
+    assert.deepEqual([...app.state.fileIndex.keys()], ['main.typ']);
+  }
+});
+
+test('a delayed upload cannot add a file to a newly opened project', async () => {
+  const { app } = harness();
+  const read = deferred();
+  const upload = app.uploadFiles({ target: { files: [{ name: 'late.typ', arrayBuffer: () => read.promise }] } });
+  app.state.repositoryLoadSerial++;
+  app.resetProjectState();
+  read.resolve(new TextEncoder().encode('old project upload').buffer);
+  await upload;
+  assert.equal(app.state.changes.size, 0);
+  assert.equal(app.state.fileIndex.size, 0);
+});
+
+test('a rename stops writing to the worker when the project changes during unmap', async () => {
+  const { app, window } = harness();
+  const unmap = deferred();
+  const paths = [];
+  app.state.fileBytes.set('main.typ', new TextEncoder().encode('main'));
+  app.mockTextPrompt(async () => 'renamed.typ');
+  window.$typst = {
+    unmapShadow: path => { paths.push(path); return unmap.promise; },
+    mapShadow: path => paths.push(path),
+  };
+  const rename = app.renameSelectedFile();
+  await nextTurn();
+  assert.deepEqual(paths, ['/repo/main.typ']);
+  app.state.repositoryLoadSerial++;
+  app.resetProjectState();
+  unmap.resolve();
+  await rename;
+  assert.deepEqual(paths, ['/repo/main.typ']);
+  assert.equal(app.state.fileIndex.size, 0);
+});
+
+test('recreating or renaming onto a tracked deletion retains its original blob for committing', async () => {
+  for (const action of ['createNewFile', 'renameSelectedFile']) {
+    const { app } = harness();
+    const path = 'restored.typ';
+    app.state.fileIndex.set(path, { path, existing: true, sha: 'original-destination', mode: '100644' });
+    app.state.fileBytes.set('main.typ', new TextEncoder().encode('rename source'));
+    app.state.deletedPaths.add(path);
+    app.state.changes.set(path, { type: 'delete' });
+    app.mockTextPrompt(async () => path);
+    app.mockOpenFile(async opened => { app.state.openPath = opened; });
+    await app[action]();
+    assert.equal(app.state.fileIndex.get(path).sha, 'original-destination');
+    assert.equal(app.state.fileIndex.get(path).existing, true);
+    assert.equal(app.state.fileIndex.get(path).renameFrom, undefined);
+    assert.equal(app.state.changes.get(path).type, 'modify');
+    assert.equal(app.state.deletedPaths.has(path), false);
+    assert.equal(app.state.openPath, path);
+  }
+});
+
+test('renaming a tracked file repeatedly retains the first source for a mode-preserving commit', async () => {
+  const { app } = harness();
+  const { state } = app;
+  state.fileIndex.get('main.typ').mode = '100755';
+  state.fileBytes.set('main.typ', new TextEncoder().encode('rename source'));
+  app.mockOpenFile(async path => { state.openPath = path; });
+  for (const path of ['intermediate.typ', 'moved.typ']) {
+    app.mockTextPrompt(async () => path);
+    await app.renameSelectedFile();
+    assert.equal(state.fileIndex.get(path).renameFrom, 'main.typ');
+    assert.equal(state.fileIndex.get(path).mode, '100755');
+  }
+  assert.equal(state.changes.get('main.typ').type, 'delete');
+  assert.equal(state.changes.has('intermediate.typ'), false);
+  assert.equal(state.changes.get('moved.typ').type, 'add');
 });
