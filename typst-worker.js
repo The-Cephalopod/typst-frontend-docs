@@ -58,10 +58,10 @@ function compileDocument(compiler, args, format = 0) {
 
 // Split the pinned renderer's SVG without constructing a DOM in the worker.
 // Unexpected structure returns null so callers can retain full-SVG rendering.
-function splitSvgPages(svg) {
+function splitSvgPages(svg, previousPages = []) {
   if (typeof svg !== 'string') return null;
-  // Match at the tag offset so each glyph doesn't need a separate tag string.
-  const tagName = /[A-Za-z_][\w:.-]*/y;
+  // Scan whole tags in the native regexp engine, including quoted delimiters.
+  const tag = /<\/?([A-Za-z_][\w:.-]*)[^>"']*(?:(?:"[^"]*"|'[^']*')[^>"']*)*>/y;
   const closingTail = /[^\s>]*\s*>/y;
   const whitespace = /\s/;
   const stack = [];
@@ -70,6 +70,16 @@ function splitSvgPages(svg) {
   while (position < svg.length) {
     const start = svg.indexOf('<', position);
     if (start < 0) break;
+    // The preceding render already validated these exact page bytes. Only
+    // reuse them at the root level, where a new page can actually start.
+    if (stack.length === 1) {
+      const previous = previousPages[ranges.length]?.trimEnd();
+      if (previous && svg.startsWith(previous, start)) {
+        position = start + previous.length;
+        ranges.push([start, position]);
+        continue;
+      }
+    }
     if (svg.startsWith('<!--', start)) {
       const end = svg.indexOf('-->', start + 4);
       if (end < 0) return null;
@@ -89,22 +99,13 @@ function splitSvgPages(svg) {
       continue;
     }
     if (svg.startsWith('<!', start)) return null;
-    let end = start + 1;
-    for (; end < svg.length; end++) {
-      const character = svg[end];
-      if (character === '>') break;
-      if (character === '"' || character === "'") {
-        end = svg.indexOf(character, end + 1);
-        if (end < 0) return null;
-      }
-    }
-    if (end === svg.length) return null;
-    const closing = svg[start + 1] === '/';
-    tagName.lastIndex = start + (closing ? 2 : 1);
-    const match = tagName.exec(svg);
+    tag.lastIndex = start;
+    const match = tag.exec(svg);
     if (!match) return null;
-    const name = match[0];
-    const nameEnd = tagName.lastIndex;
+    const end = tag.lastIndex - 1;
+    const closing = svg[start + 1] === '/';
+    const name = match[1];
+    const nameEnd = start + (closing ? 2 : 1) + name.length;
     if (closing) {
       if (nameEnd !== end) {
         closingTail.lastIndex = nameEnd;
@@ -172,9 +173,9 @@ let previewRevision = 0;
 
 function packagePreview(svg, diagnostics, args = {}) {
   if (!svg) return { svg: null, svgParts: null, diagnostics };
-  const parts = splitSvgPages(svg);
-  if (!parts) { lastPreviewParts = null; return { svg, svgParts: null, diagnostics }; }
   const previous = lastPreviewParts;
+  const parts = splitSvgPages(svg, previous?.pages);
+  if (!parts) { lastPreviewParts = null; return { svg, svgParts: null, diagnostics }; }
   lastPreviewParts = { ...parts, revision: ++previewRevision };
   if (!args.partsOnly) return { svg, svgParts: lastPreviewParts, diagnostics };
   if (previous && args.baseRevision === previous.revision) {

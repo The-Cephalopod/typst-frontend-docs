@@ -40,6 +40,14 @@ function pageClassIsReadFromItsOwnAttribute() {
   assert.equal(join(parts), svg);
 }
 
+function quotedTagDelimitersAndLongAttributeListsRemainIntact() {
+  const attrs = ' data-note="a > b < c" data-other=\'single > quote\''.repeat(1000);
+  const content = '<g data-lines="first\nsecond"><path' + attrs + '/></g>';
+  const svg = opening + page('quoted', content) + '</svg>';
+  assert.equal(join(split(svg)), svg);
+  assert.equal(split(opening + page('broken', '<path data-note="unterminated') + '</svg>'), null);
+}
+
 function scriptsStylesCommentsAndCdataDoNotAlterDepth() {
   const prefix = '<style><![CDATA[.example::after { content: "<g class=typst-page>"; }]]></style>' +
     '<!-- <g class="typst-page"> --><?fixture processing?>';
@@ -90,6 +98,23 @@ function largeUnchangedPagesAreStableAcrossEdits() {
     'Editing one page must leave every other page source reusable.');
 }
 
+function reusedPagesPreserveBoundariesAndValidation() {
+  const first = page('one', '<g><path d="M0 0"/></g>');
+  const second = page('two');
+  const third = page('three');
+  const previous = split(opening + first + '\n' + second + ' ' + third + '</svg>').pages;
+  for (const svg of [
+    opening + first + '  \n' + second + '\n<defs/></svg>',
+    opening + second + first + third + '</svg>',
+    opening + '<defs>' + first + '</defs>' + second + '</svg>',
+  ]) {
+    assert.deepEqual(split(svg, previous), split(svg));
+    assert.equal(join(split(svg, previous)), svg);
+  }
+  assert.equal(split(opening + first + 'unexpected' + second + '</svg>', previous), null);
+  assert.equal(split(opening + first + '<!-- unclosed</svg>', previous), null);
+}
+
 function transportSendsOnlyChangedPagesForAMatchingRevision() {
   const pages = Array.from({ length: 45 }, (_, i) => page(`p${i}`, `<text>Page ${i}</text>`));
   const svg = opening + '<defs/>' + pages.join('') + '</svg>';
@@ -138,8 +163,10 @@ function transportHandlesPageInsertionAndRemoval() {
 }
 
 const tests = [nestedGraphicsAndSharedDefinitionsRemainIntact, pageClassIsReadFromItsOwnAttribute,
+  quotedTagDelimitersAndLongAttributeListsRemainIntact,
   scriptsStylesCommentsAndCdataDoNotAlterDepth, emptyPagesAndMalformedFallback,
-  largeUnchangedPagesAreStableAcrossEdits, transportSendsOnlyChangedPagesForAMatchingRevision,
+  largeUnchangedPagesAreStableAcrossEdits, reusedPagesPreserveBoundariesAndValidation,
+  transportSendsOnlyChangedPagesForAMatchingRevision,
   transportRetainsSuccessfulBaseAcrossSyntaxErrorsAndHandlesFallback, transportHandlesPageInsertionAndRemoval];
 for (const test of tests) { test(); console.log(`PASS ${test.name}`); }
 console.log(`${tests.length} SVG page-splitting checks passed. These test structure and fallback behavior, not browser rendering.`);
