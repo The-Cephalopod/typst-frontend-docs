@@ -17,8 +17,8 @@ function getEngine() {
       $typst.setCompilerInitOptions({ getModule: () => COMPILER_WASM_URL });
       $typst.setRendererInitOptions({ getModule: () => RENDERER_WASM_URL });
       // Warm both modules before the first edit or SVG conversion.
-      const [compiler] = await Promise.all([$typst.getCompiler(), $typst.getRenderer()]);
-      return { runtime: $typst, compiler };
+      const [compiler, renderer] = await Promise.all([$typst.getCompiler(), $typst.getRenderer()]);
+      return { runtime: $typst, compiler, renderer };
     })();
   }
   return enginePromise;
@@ -193,6 +193,66 @@ function packagePreview(svg, diagnostics, args = {}) {
   return { svg: null, svgParts: lastPreviewParts, diagnostics };
 }
 
+const MAX_INCREMENTAL_DELTA_BYTES = 32 * 1024 * 1024;
+const INCREMENTAL_DIAGNOSTIC_FORMATS = new Map([['none', 1], ['unix', 2], ['full', 3]]);
+let incrementalPreview = null;
+let incrementalPreviewDisabled = false;
+
+async function closeIncrementalPreview() {
+  const previous = incrementalPreview;
+  incrementalPreview = null;
+  if (previous) {
+    previous.release();
+    await previous.closed.catch(() => {});
+  }
+}
+
+async function incrementalSessionFor(compiler, renderer, identity) {
+  if (incrementalPreview?.identity === identity && incrementalPreview.deltaBytes < MAX_INCREMENTAL_DELTA_BYTES) {
+    return incrementalPreview;
+  }
+  await closeIncrementalPreview();
+  const server = compiler.create_incr_server();
+  let release, ready, failed;
+  const held = new Promise(resolve => { release = resolve; });
+  const session = new Promise((resolve, reject) => { ready = resolve; failed = reject; });
+  // Keep the renderer session alive until the matching compiler server is
+  // replaced. runWithSession frees it on exit and we release the server too.
+  const closed = Promise.resolve().then(() => renderer.runWithSession(async renderSession => {
+    ready(renderSession);
+    await held;
+  })).finally(() => server.free());
+  closed.catch(failed);
+  incrementalPreview = { identity, server, session, release, closed, hasVector: false, deltaBytes: 0 };
+  return incrementalPreview;
+}
+
+async function compileIncrementalPreview(compiler, renderer, args) {
+  const options = compileOptions(args);
+  const inputs = options.inputs ? Object.entries(options.inputs) : undefined;
+  const identity = JSON.stringify([options.root, options.mainFilePath, inputs]);
+  const preview = await incrementalSessionFor(compiler, renderer, identity);
+  const session = await preview.session;
+  // The high-level incremental compile wrapper doesn't free its world.
+  // Use the pinned WASM bindings to release every source snapshot explicitly.
+  const world = compiler.snapshot(options.root, options.mainFilePath, inputs);
+  let result;
+  try {
+    const diagnosticsFormat = INCREMENTAL_DIAGNOSTIC_FORMATS.get(options.diagnostics) ?? 3;
+    result = world.incr_compile(preview.server, diagnosticsFormat);
+  } finally {
+    world.free();
+  }
+  const diagnostics = cloneDiagnostics(result?.diagnostics);
+  // An invalid document has no delta. Keep the last valid renderer state.
+  if (!result?.result) return packagePreview(null, diagnostics, args);
+  session.manipulateData({ action: preview.hasVector ? 'merge' : 'reset', data: result.result });
+  if (preview.hasVector) preview.deltaBytes += result.result.byteLength;
+  preview.hasVector = true;
+  const svg = await session.renderSvg({});
+  return packagePreview(svg, diagnostics, args);
+}
+
 const methods = {
   async init() {
     await getEngine();
@@ -200,11 +260,13 @@ const methods = {
   },
   async reset() {
     const { compiler } = await getEngine();
+    await closeIncrementalPreview();
     await compiler.reset();
     return true;
   },
   async resetShadow() {
     const { compiler } = await getEngine();
+    await closeIncrementalPreview();
     compiler.resetShadow();
     lastPreviewParts = null;
     return true;
@@ -232,7 +294,19 @@ const methods = {
     return runtime.svg({ vectorData: args.vectorData });
   },
   async compilePreview(args) {
-    const { compiler, runtime } = await getEngine();
+    const { compiler, renderer, runtime } = await getEngine();
+    const nativeCompiler = compiler.compiler;
+    if (!incrementalPreviewDisabled && typeof nativeCompiler?.create_incr_server === 'function' &&
+        typeof nativeCompiler.snapshot === 'function' && typeof renderer?.runWithSession === 'function') {
+      try {
+        return await compileIncrementalPreview(nativeCompiler, renderer, args);
+      } catch {
+        // A failed merge may have advanced one half of the pair. Release
+        // both and retry with a complete snapshot for this worker's lifetime.
+        incrementalPreviewDisabled = true;
+        await closeIncrementalPreview();
+      }
+    }
     const result = await compileDocument(compiler, args);
     const diagnostics = cloneDiagnostics(result?.diagnostics);
     // Keep the potentially large vector artifact inside this worker.

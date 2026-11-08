@@ -2347,7 +2347,7 @@
   function disposePreviewPages() {
     state.previewPageObserver?.disconnect();
     state.previewPageObserver = null;
-    clearTimeout(state.previewMountTimer);
+    state.previewMountTimer?.cancel();
     state.previewMountTimer = null;
   }
 
@@ -2413,9 +2413,9 @@
 
   function schedulePreviewPageMounts() {
     if (state.previewMountTimer != null) return;
-    // One visible page per task; the browser can process input and paint the
-    // editor between pages. Off-screen pages remain lightweight placeholders.
-    state.previewMountTimer = setTimeout(() => {
+    // Mount one visible page at a time so the browser can paint the editor
+    // first. A short deadline keeps previews moving during continuous input.
+    const mountNext = () => {
       state.previewMountTimer = null;
       const cache = state.previewSvgCache;
       if (cache?.mode !== 'cards') return;
@@ -2424,7 +2424,14 @@
       mountPreviewPage(page);
       if (cache.pages.some(page => page.visible && page.raw !== page.mountedRaw)) schedulePreviewPageMounts();
       else schedulePreviewSourceAnchorIndexing();
-    }, 0);
+    };
+    if (state.previewSvgCache?.pages.length > 1 && typeof window.requestIdleCallback === 'function') {
+      const handle = window.requestIdleCallback(mountNext, { timeout: 24 });
+      state.previewMountTimer = { cancel: () => window.cancelIdleCallback(handle) };
+    } else {
+      const handle = setTimeout(mountNext, 0);
+      state.previewMountTimer = { cancel: () => clearTimeout(handle) };
+    }
   }
 
   function installPreviewSvg(svg, parts) {

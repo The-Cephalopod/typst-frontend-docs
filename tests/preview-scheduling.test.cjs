@@ -50,7 +50,7 @@ function harness() {
   let source = fs.readFileSync(appPath, 'utf8');
   source = source.replace(/  boot\(\)\.catch\(err => \{[\s\S]*?\n  \}\);\n\}\)\(\);\s*$/, `
   globalThis.appTest = { state, els, onEditorChanged, scheduleCompile, compilePreview, compilePreviewOnce, exportPdf,
-    createWorkerTypstRuntime, ensureTypstRuntime, route,
+    createWorkerTypstRuntime, ensureTypstRuntime, route, schedulePreviewPageMounts, disposePreviewPages,
     setGrammarEnabled,
     hooks(h) {
       if (h.compilePreview) compilePreview = h.compilePreview;
@@ -492,6 +492,35 @@ async function workerPageDeltasUseReceivedSnapshotsAndRecoverAfterReset() {
   await rejected;
 }
 
+async function visiblePageMountsUseBoundedIdleWorkAndCancelOnReset() {
+  const { app, window, timers, advance } = harness();
+  const requests = [], cancelled = [];
+  window.requestIdleCallback = (_mount, { timeout }) => requests.push(timeout);
+  window.cancelIdleCallback = handle => cancelled.push(handle);
+
+  app.state.previewSvgCache = { pages: [{}, {}] };
+  app.schedulePreviewPageMounts();
+  app.schedulePreviewPageMounts();
+  assert.deepEqual(requests, [24], 'Only one page mount may be queued, with a deadline.');
+  app.state.previewSvgCache = null;
+  app.disposePreviewPages();
+  assert.deepEqual(cancelled, [1]);
+  assert.equal(app.state.previewMountTimer, null);
+
+  app.state.previewSvgCache = { pages: [{}] };
+  app.schedulePreviewPageMounts();
+  assert.equal(timers.size, 1, 'Single-page documents can mount in the next task.');
+  app.disposePreviewPages();
+  assert.equal(timers.size, 0);
+
+  delete window.requestIdleCallback;
+  app.state.previewSvgCache = { pages: [{}, {}] };
+  app.schedulePreviewPageMounts();
+  assert.equal(timers.size, 1, 'Browsers without idle callbacks still queue mounts.');
+  await advance(0);
+  assert.equal(app.state.previewMountTimer, null);
+}
+
 (async () => {
   const tests = [continuousInputKeepsFirstFrameDeadline, keystrokesNeverReadOrCompileTheWholeDocument,
     unavailableWorkersNeverLoadTheCompilerOnTheInputThread,
@@ -502,7 +531,8 @@ async function workerPageDeltasUseReceivedSnapshotsAndRecoverAfterReset() {
     latestInvalidSyntaxKeepsTheLastGoodPreviewAndShowsDiagnostics, supersededSyntaxErrorsDoNotReplaceLatestDiagnostics,
     supersededWarningsDoNotPublishWithValidPreview,
     workerClientClonesBuffersAndCleansUpErrors, failedWorkerInitializationNeverBlocksTheEditorAndCanRetry,
-    failedCompileStillProcessesNewerQueuedEdit, persistentFailureOfOneRevisionDoesNotLoop, workerPageDeltasUseReceivedSnapshotsAndRecoverAfterReset];
+    failedCompileStillProcessesNewerQueuedEdit, persistentFailureOfOneRevisionDoesNotLoop,
+    workerPageDeltasUseReceivedSnapshotsAndRecoverAfterReset, visiblePageMountsUseBoundedIdleWorkAndCancelOnReset];
   for (const test of tests) { await test(); console.log(`PASS ${test.name}`); }
   console.log(`${tests.length} preview scheduling/client checks passed. Timers, browser elements and worker transport are controlled VM doubles.`);
 })().catch(error => { console.error(error); process.exitCode = 1; });
