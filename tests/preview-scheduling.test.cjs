@@ -192,6 +192,38 @@ async function completedValidSnapshotsPublishWhileTypingContinues() {
   assert.equal(h.app.els['preview-output'].innerHTML, '<svg id="latest"></svg>');
 }
 
+async function activePreviewDefersIdleSyncAndTheQueuedPassTakesTheNewestEdit() {
+  const h = harness(), first = deferred(), second = deferred(), snapshots = [];
+  let compiles = 0;
+  h.app.hooks({
+    syncOpenFileFromEditor: async () => {
+      snapshots.push(h.app.state.editRevision);
+      h.app.state.editorSyncPending = false;
+    },
+    compileVectorWithDiagnostics: () => (++compiles === 1 ? first : second).promise,
+  });
+  const running = h.app.compilePreview();
+  await ticks();
+  for (const text of ['a', '', 'b']) {
+    h.app.onEditorChanged({ changes: [{ text }] });
+    await h.advance(100);
+  }
+  assert.deepEqual(snapshots, [0], 'The idle timer must not queue intermediate shadow writes behind an active preview.');
+  assert.equal(h.app.state.editorSyncPending, true, 'The latest source must remain pending for the queued preview or an explicit flush.');
+  first.resolve({ svg: '<svg id="snapshot"></svg>', diagnostics: [] });
+  await ticks();
+  assert.deepEqual(snapshots, [0, 3], 'The next preview snapshots the latest insertion or deletion directly.');
+  assert.equal(h.app.els['preview-output'].innerHTML, '<svg id="snapshot"></svg>', 'The completed preview publishes before the next compile finishes.');
+  second.resolve({ svg: '<svg id="latest"></svg>', diagnostics: [] });
+  await running;
+  assert.equal(h.app.els['preview-output'].innerHTML, '<svg id="latest"></svg>');
+
+  h.app.state.mainPath = null;
+  h.app.onEditorChanged({ changes: [{ text: 'c' }] });
+  await h.advance(90);
+  assert.deepEqual(snapshots, [0, 3, 4], 'Idle syncing resumes when no preview is active.');
+}
+
 async function dataEditsAlsoRequestAPreview() {
   const h = harness();
   h.app.state.openPath = 'data.json';
@@ -464,6 +496,7 @@ async function workerPageDeltasUseReceivedSnapshotsAndRecoverAfterReset() {
   const tests = [continuousInputKeepsFirstFrameDeadline, keystrokesNeverReadOrCompileTheWholeDocument,
     unavailableWorkersNeverLoadTheCompilerOnTheInputThread,
     queuedCompilesCoalesceToTheLatestRevisionWithoutOverlap, completedValidSnapshotsPublishWhileTypingContinues,
+    activePreviewDefersIdleSyncAndTheQueuedPassTakesTheNewestEdit,
     dataEditsAlsoRequestAPreview, changedMainFileAndRouteCannotPublishOldOutput, stalePdfExportCannotUpdateAnotherProject,
     grammarChecksCoalesceAndNeverOfferStaleEdits,
     latestInvalidSyntaxKeepsTheLastGoodPreviewAndShowsDiagnostics, supersededSyntaxErrorsDoNotReplaceLatestDiagnostics,

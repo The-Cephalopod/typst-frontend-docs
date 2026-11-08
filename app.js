@@ -1636,6 +1636,9 @@
     clearTimeout(state.editorSyncTimer);
     state.editorSyncTimer = setTimeout(() => {
       state.editorSyncTimer = null;
+      // The queued preview takes the newest snapshot when the active compile
+      // finishes. Intermediate shadow writes only delay that snapshot.
+      if (state.compileInFlight && state.mainPath) return;
       syncOpenFileFromEditor().catch(err => console.error('Editor sync failed', err));
     }, 90);
 
