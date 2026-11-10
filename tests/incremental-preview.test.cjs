@@ -42,6 +42,16 @@ function harness() {
     },
     async reset() { calls.push('compiler reset'); },
     resetShadow() { calls.push('shadow reset'); },
+    mapShadow() {},
+    unmapShadow() {},
+    setFonts(resolver) { calls.push(['font set', ...resolver.fonts]); },
+    compilerJs: { TypstFontResolverBuilder: class {
+      constructor() { this.fonts = []; }
+      get_font_info(bytes) { return { info: bytes[0] ? [bytes[0]] : [] }; }
+      add_lazy_font(info, load) { assert.equal(load()[0], info.info[0]); this.fonts.push(info.info[0]); }
+      async build() { return { fonts: this.fonts, free() {} }; }
+      free() {}
+    } },
   };
   const renderer = {
     async runWithSession(run) {
@@ -60,7 +70,7 @@ function harness() {
     },
   };
   const runtime = { async svg() { calls.push('full svg'); return svg; } };
-  const context = vm.createContext({ self: {}, engine: { compiler, renderer, runtime }, Uint8Array });
+  const context = vm.createContext({ self: {}, engine: { compiler, renderer, runtime, defaultFontUrls: [] }, Uint8Array });
   vm.runInContext(source + '\ngetEngine = async () => engine; globalThis.workerMethods = methods;', context, { filename: workerPath });
   return { methods: context.workerMethods, calls, control, compiler };
 }
@@ -118,4 +128,33 @@ test('the full worker preview remains usable without native incremental bindings
   const result = await methods.compilePreview({ options });
   assert.equal(result.svg, svg);
   assert.deepEqual(calls, ['full vector', 'full svg']);
+});
+
+test('repository fonts update once per changed set and are shared by preview and PDF', async () => {
+  const { methods, calls } = harness();
+  const font = '/repo/custom.ttf';
+  const fontUpdates = () => calls.filter(call => Array.isArray(call) && call[0] === 'font set');
+  await methods.compilePreview({ options });
+  assert.deepEqual(fontUpdates(), []);
+
+  await methods.mapShadow({ path: font, bytes: new Uint8Array([42]) });
+  await methods.pdf({ options });
+  assert.deepEqual(fontUpdates(), [['font set', 42]]);
+  await methods.mapShadow({ path: '/repo/main.typ', bytes: new Uint8Array([123]) });
+  await methods.compilePreview({ options });
+  await methods.resetShadow();
+  await methods.mapShadow({ path: font, bytes: new Uint8Array([42]) });
+  await methods.compilePreview({ options });
+  assert.deepEqual(fontUpdates(), [['font set', 42]], 'Typing and rehydration of unchanged assets must reuse the resolver');
+
+  await methods.mapShadow({ path: font, bytes: new Uint8Array([0]) });
+  const damaged = await methods.compilePreview({ options });
+  assert.equal(damaged.diagnostics[0].path, font);
+  assert.match(damaged.diagnostics[0].message, /valid TrueType or OpenType/);
+  assert.deepEqual(fontUpdates(), [['font set', 42], ['font set']]);
+
+  await methods.unmapShadow({ path: font });
+  const cleaned = await methods.compilePreview({ options });
+  assert.equal(cleaned.diagnostics.length, 0);
+  assert.deepEqual(fontUpdates(), [['font set', 42], ['font set']]);
 });

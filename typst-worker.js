@@ -13,15 +13,98 @@ let enginePromise;
 function getEngine() {
   if (!enginePromise) {
     enginePromise = (async () => {
-      const { $typst } = await import(RUNTIME_URL);
-      $typst.setCompilerInitOptions({ getModule: () => COMPILER_WASM_URL });
+      const { $typst, loadFonts } = await import(RUNTIME_URL);
+      const defaultFontUrls = [];
+      $typst.setCompilerInitOptions({
+        getModule: () => COMPILER_WASM_URL,
+        beforeBuild: [loadFonts([], { assets: ['text'], fetcher: url => {
+          defaultFontUrls.push(url);
+          return fetch(url);
+        } })],
+      });
       $typst.setRendererInitOptions({ getModule: () => RENDERER_WASM_URL });
       // Warm both modules before the first edit or SVG conversion.
       const [compiler, renderer] = await Promise.all([$typst.getCompiler(), $typst.getRenderer()]);
-      return { runtime: $typst, compiler, renderer };
+      return { runtime: $typst, compiler, renderer, defaultFontUrls };
     })();
   }
   return enginePromise;
+}
+
+// Keep source writes and font registration on the same worker queue. Rebuild
+// the resolver only when a font changes, never while processing ordinary edits.
+const REPOSITORY_FONT = /\.(?:ttf|otf|ttc|otc|woff2?)$/i;
+const MAX_REPOSITORY_FONT_BYTES = 25 * 1024 * 1024;
+let repositoryFonts = new Map();
+let appliedFonts = new Map();
+let fontsChanged = false;
+let customFontsInstalled = false;
+let fontDiagnostics = [];
+
+function setRepositoryFont(path, bytes) {
+  if (!REPOSITORY_FONT.test(path)) return;
+  const previous = repositoryFonts.get(path) || appliedFonts.get(path);
+  // A fallback hydration can map the same assets again. Reuse the installed
+  // resolver when its contents are unchanged.
+  const font = bytes.byteLength > MAX_REPOSITORY_FONT_BYTES ? null : bytes;
+  if (previous !== font && !(previous && font && previous.length === font.length && previous.every((byte, i) => byte === font[i]))) {
+    repositoryFonts.set(path, font);
+  } else {
+    repositoryFonts.set(path, previous);
+  }
+  fontsChanged = true;
+}
+
+async function updateRepositoryFonts({ compiler, defaultFontUrls }) {
+  if (repositoryFonts.size === appliedFonts.size && [...repositoryFonts].every(([path, bytes]) => appliedFonts.get(path) === bytes)) {
+    fontsChanged = false;
+    return;
+  }
+  const diagnostics = [];
+  const builder = new compiler.compilerJs.TypstFontResolverBuilder();
+  let consumed = false;
+  let registered = 0;
+  try {
+    for (const path of [...repositoryFonts.keys()].sort()) {
+      const bytes = repositoryFonts.get(path);
+      try {
+        if (!bytes) throw new Error('Use a font file under 25 MB.');
+        const info = builder.get_font_info(bytes);
+        if (!info?.info?.length) throw new Error('Replace it with a valid TrueType or OpenType font.');
+        // Let Typst copy the font into WASM only when the document uses it.
+        builder.add_lazy_font(info, () => bytes);
+        registered++;
+      } catch (error) {
+        diagnostics.push({ path, severity: 'warning', message: `Could not load repository font. ${error?.message || 'Replace it with a valid TrueType or OpenType font.'}` });
+      }
+    }
+
+    if (registered || customFontsInstalled) {
+      // Use the same bundled defaults as startup. These versioned assets were
+      // just loaded by this worker and can be reused from the browser cache.
+      const defaults = await Promise.all(defaultFontUrls.map(async url => {
+        const response = await fetch(url, { cache: 'force-cache' });
+        if (!response.ok) throw new Error(`Could not reload Typst's default fonts (${response.status}). Check your connection and retry.`);
+        return new Uint8Array(await response.arrayBuffer());
+      }));
+      for (const bytes of defaults) builder.add_raw_font(bytes);
+      consumed = true;
+      const resolver = await builder.build();
+      try {
+        await closeIncrementalPreview();
+        compiler.setFonts(resolver);
+      } finally { resolver.free(); }
+    }
+    customFontsInstalled = registered > 0;
+    fontDiagnostics = diagnostics;
+    appliedFonts = new Map(repositoryFonts);
+    fontsChanged = false;
+  } finally { if (!consumed) builder.free(); }
+}
+
+function compileDiagnostics(diagnostics) {
+  const result = cloneDiagnostics(diagnostics);
+  return fontDiagnostics.length ? [...fontDiagnostics, ...result] : result;
 }
 
 function cloneDiagnostics(diagnostics) {
@@ -243,7 +326,7 @@ async function compileIncrementalPreview(compiler, renderer, args) {
   } finally {
     world.free();
   }
-  const diagnostics = cloneDiagnostics(result?.diagnostics);
+  const diagnostics = compileDiagnostics(result?.diagnostics);
   // An invalid document has no delta. Keep the last valid renderer state.
   if (!result?.result) return packagePreview(null, diagnostics, args);
   session.manipulateData({ action: preview.hasVector ? 'merge' : 'reset', data: result.result });
@@ -268,6 +351,10 @@ const methods = {
     const { compiler } = await getEngine();
     await closeIncrementalPreview();
     compiler.resetShadow();
+    if (repositoryFonts.size) {
+      repositoryFonts.clear();
+      fontsChanged = true;
+    }
     lastPreviewParts = null;
     return true;
   },
@@ -276,17 +363,23 @@ const methods = {
       throw new TypeError('A path and Uint8Array are required.');
     }
     const { compiler } = await getEngine();
-    return compiler.mapShadow(args.path, args.bytes) !== false;
+    if (compiler.mapShadow(args.path, args.bytes) === false) return false;
+    setRepositoryFont(args.path, args.bytes);
+    return true;
   },
   async unmapShadow(args) {
     if (typeof args?.path !== 'string') throw new TypeError('A path is required.');
     const { compiler } = await getEngine();
-    return compiler.unmapShadow(args.path) !== false;
+    if (compiler.unmapShadow(args.path) === false) return false;
+    if (repositoryFonts.delete(args.path)) fontsChanged = true;
+    return true;
   },
   async compile(args) {
-    const { compiler } = await getEngine();
+    const engine = await getEngine();
+    const { compiler } = engine;
+    if (fontsChanged) await updateRepositoryFonts(engine);
     const result = await compileDocument(compiler, args);
-    return { result: result?.result, diagnostics: cloneDiagnostics(result?.diagnostics) };
+    return { result: result?.result, diagnostics: compileDiagnostics(result?.diagnostics) };
   },
   async svg(args) {
     if (!(args?.vectorData instanceof Uint8Array)) throw new TypeError('Vector data is required.');
@@ -294,7 +387,9 @@ const methods = {
     return runtime.svg({ vectorData: args.vectorData });
   },
   async compilePreview(args) {
-    const { compiler, renderer, runtime } = await getEngine();
+    const engine = await getEngine();
+    const { compiler, renderer, runtime } = engine;
+    if (fontsChanged) await updateRepositoryFonts(engine);
     const nativeCompiler = compiler.compiler;
     if (!incrementalPreviewDisabled && typeof nativeCompiler?.create_incr_server === 'function' &&
         typeof nativeCompiler.snapshot === 'function' && typeof renderer?.runWithSession === 'function') {
@@ -308,19 +403,21 @@ const methods = {
       }
     }
     const result = await compileDocument(compiler, args);
-    const diagnostics = cloneDiagnostics(result?.diagnostics);
+    const diagnostics = compileDiagnostics(result?.diagnostics);
     // Keep the potentially large vector artifact inside this worker.
     const svg = result?.result ? await runtime.svg({ vectorData: result.result }) : null;
     return packagePreview(svg, diagnostics, args);
   },
   async pdf(args) {
-    const { compiler } = await getEngine();
+    const engine = await getEngine();
+    const { compiler } = engine;
+    if (fontsChanged) await updateRepositoryFonts(engine);
     // The convenience pdf wrapper resets compiler caches; native format 1
     // exports the same document while retaining the current compilation state.
     const result = await compileDocument(compiler, args, 1);
     if (!(result?.result instanceof Uint8Array)) {
       const error = new Error('Typst could not export the PDF.');
-      error.diagnostics = cloneDiagnostics(result?.diagnostics);
+      error.diagnostics = compileDiagnostics(result?.diagnostics);
       throw error;
     }
     return result.result;

@@ -95,6 +95,27 @@
       return this.request(`${repoPath(owner, repo)}/git/blobs/${encodeURIComponent(sha)}`);
     }
 
+    createBranch(owner, repo, branch, sha) {
+      return this.request(`${repoPath(owner, repo)}/branches`, {
+        method: 'POST', body: { new_branch_name: branch, old_ref_name: sha },
+      });
+    }
+
+    createPullRequest(owner, repo, head, base, title, body) {
+      return this.request(`${repoPath(owner, repo)}/pulls`, {
+        method: 'POST', body: { head, base, title, body },
+      });
+    }
+
+    async findOpenPullRequest(owner, repo, head, base) {
+      for (let page = 1; ; page++) {
+        const pulls = await this.request(`${repoPath(owner, repo)}/pulls?state=open&limit=50&page=${page}`, { cache: 'no-store' });
+        const pull = pulls.find(item => item.head?.ref === head && item.base?.ref === base &&
+          item.head?.repo?.full_name?.toLowerCase() === `${owner}/${repo}`.toLowerCase());
+        if (pull || pulls.length < 50) return pull;
+      }
+    }
+
     async searchRepos(query) {
       const q = query.trim();
       if (!q && !this.getToken()) return [];
@@ -139,7 +160,7 @@
         throw error;
       }
       if (latest.object.sha !== headSha) {
-        throw apiError(409, 'The branch changed on Codeberg after you opened it. Reload the project before committing.');
+        throw apiError(409, 'The branch changed on Codeberg. Sync remote changes before committing.');
       }
 
       // Forgejo creates one commit and pushes without force. The API checks

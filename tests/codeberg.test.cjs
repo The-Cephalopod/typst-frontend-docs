@@ -164,3 +164,39 @@ test('surfaces a server-side batch conflict and requires an original blob for up
   ])), /original Codeberg blob/);
   assert.equal(calls.length, 2);
 });
+
+test('creates a branch from the loaded revision and opens a pull request with the connected account', async () => {
+  const head = 'drafts/chapter';
+  const base = 'release/notes';
+  const sha = 'cba9876543210cba9876543210cba9876543210cd';
+  const html_url = 'https://codeberg.org/owner/project/pulls/17';
+  const { client, calls } = createClient(({ path }) => path.endsWith('/branches')
+    ? { name: head, commit: { id: sha } }
+    : { html_url }, 'connected');
+
+  assert.equal((await client.createBranch('owner', 'project', head, sha)).commit.id, sha);
+  assert.equal((await client.createPullRequest('owner', 'project', head, base, 'Review chapter', 'Résumé\n\nSecond paragraph.')).html_url, html_url);
+  assert.deepEqual(calls.map(call => [call.method, call.path, call.headers.Authorization, call.body]), [
+    ['POST', '/repos/owner/project/branches', 'token connected', { new_branch_name: head, old_ref_name: sha }],
+    ['POST', '/repos/owner/project/pulls', 'token connected', { head, base, title: 'Review chapter', body: 'Résumé\n\nSecond paragraph.' }],
+  ]);
+
+  const denied = createClient(() => Response.json({ message: 'Pull requests are disabled' }, { status: 403 }), 'connected');
+  await assert.rejects(denied.client.createPullRequest('owner', 'project', head, base, 'Review', ''), {
+    status: 403, message: 'Pull requests are disabled',
+  });
+});
+
+test('finds the exact open pull request across pages and excludes another repository or base', async () => {
+  const makePull = (number, full_name, base) => ({ number, head: { ref: 'drafts/chapter', repo: { full_name } }, base: { ref: base } });
+  const expected = makePull(51, 'Owner/Project', 'main');
+  const { client, calls } = createClient(({ query }) => query.page === '1'
+    ? [makePull(1, 'fork/project', 'main'), ...Array.from({ length: 49 }, (_, i) => makePull(i + 2, 'owner/project', 'other'))]
+    : [expected], 'connected');
+  assert.deepEqual(await client.findOpenPullRequest('owner', 'project', 'drafts/chapter', 'main'), expected);
+  assert.deepEqual(calls.map(({ path, query, cache }) => [path, query, cache]), [
+    ['/repos/owner/project/pulls', { state: 'open', limit: '50', page: '1' }, 'no-store'],
+    ['/repos/owner/project/pulls', { state: 'open', limit: '50', page: '2' }, 'no-store'],
+  ]);
+  assert.equal(await client.findOpenPullRequest('owner', 'project', 'drafts/other', 'main'), undefined);
+});

@@ -24,7 +24,7 @@ function element() {
     },
     innerHTML: '', textContent: '', style: {},
     querySelector: () => ({ textContent: '' }),
-    remove: noop, appendChild: noop,
+    remove: noop, appendChild: noop, scrollIntoView: noop,
   };
 }
 
@@ -53,6 +53,7 @@ function harness() {
       if (h.applyDiagnosticMarkersForOpenFile) applyDiagnosticMarkersForOpenFile = h.applyDiagnosticMarkersForOpenFile;
       if (h.settleEditorLayout) settleEditorLayout = h.settleEditorLayout;
       if (h.updateFileTreeSelection) updateFileTreeSelection = h.updateFileTreeSelection;
+      if (h.addFileTab) addFileTab = h.addFileTab;
       if (h.compileVectorWithDiagnostics) compileVectorWithDiagnostics = h.compileVectorWithDiagnostics;
       if (h.compilePreviewOnce) compilePreviewOnce = h.compilePreviewOnce;
     }
@@ -79,8 +80,8 @@ function harness() {
   const app = context.appTest;
   for (const name of ['home-view', 'editor-view', 'compile-status', 'repo-sync-status',
     'preview-output', 'preview-error', 'diagnostic-list', 'preview-error-text', 'preview-loading',
-    'commit-btn', 'change-count-badge', 'tab-dirty-dot', 'main-file-label', 'file-count-label',
-    'status-current-file', 'tab-file-name', 'tab-file-icon', 'editor-container', 'binary-file-view', 'branch-select']) {
+    'commit-btn', 'change-count-badge', 'main-file-label', 'file-count-label',
+    'status-current-file', 'cursor-position', 'empty-editor', 'editor-container', 'binary-file-view', 'branch-select']) {
     app.els[name] = element();
   }
   return { app, context, window, document, location };
@@ -210,6 +211,22 @@ function project(app, name) {
     path: `${name}.typ`, existing: false, size: 8,
     bytes: new TextEncoder().encode(`= ${name}`),
   });
+}
+
+function mockEditorModels(app) {
+  const values = [];
+  let model = null;
+  app.state.editor = {
+    setModel: value => { model = value; }, getModel: () => model,
+    getPosition: () => ({ lineNumber: 1, column: 1 }), focus: noop,
+  };
+  app.state.monaco = { editor: { createModel: value => { values.push(value); return {}; } } };
+  app.hooks({ addFileTab: path => {
+    const tab = { element: element(), model: null, open: { setAttribute: noop }, dot: element() };
+    app.state.openTabs.set(path, tab);
+    return tab;
+  } });
+  return values;
 }
 
 async function runtimeWaitCannotHydrateAReplacementProject() {
@@ -401,9 +418,7 @@ async function repositoryAndEditorRequestsRunInParallel() {
   app.github.getCommit = async () => ({ tree: { sha: 'tree' } });
   app.github.getTree = async () => ({ tree: [{ path: 'main.typ', type: 'blob', sha: 'blob', size: 7 }] });
   app.github.getBlob = async () => ({ content: Buffer.from('= Ready').toString('base64') });
-  const values = [];
-  app.state.editor = { setValue: value => values.push(value), getModel: () => ({}), focus: noop };
-  app.state.monaco = { editor: { setModelLanguage: noop } };
+  const values = mockEditorModels(app);
   const opening = app.openRepository('fixture', 'project', null);
   assert(metadataRequested && editorRequested, 'GitHub metadata must not wait for Monaco startup.');
   metadata.resolve({ owner: { login: 'fixture' }, name: 'project', full_name: 'fixture/project', default_branch: 'main' });
@@ -492,9 +507,7 @@ async function codebergUsesItsOwnMetadataBranchAndBlobRequests() {
     }
   };
   app.github.getRepo = () => assert.fail('A Codeberg route must not contact GitHub.');
-  const values = [];
-  app.state.editor = { setValue: value => values.push(value), getModel: () => ({}), focus: noop };
-  app.state.monaco = { editor: { setModelLanguage: noop } };
+  const values = mockEditorModels(app);
   await app.openRepository('owner', 'project', 'trunk', undefined, 'codeberg');
   assert.deepEqual(requests, [['repo', 'owner', 'project'], ['ref', 'trunk'], ['commit', 'commit'], ['tree', 'tree'], ['blob', 'blob']]);
   assert.deepEqual(values, ['= Codeberg']);
