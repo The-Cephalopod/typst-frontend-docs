@@ -3407,16 +3407,19 @@
   }
 
   function handleEditorPreviewClick(event) {
-    if (!state.openPath || !isTextPath(state.openPath) || !event?.target?.position) return;
-    // Find/replace controls and other overlay widgets are not source clicks.
-    if (event.target.type !== state.monaco.editor.MouseTargetType.CONTENT_TEXT) return;
+    const target = event?.target;
+    if (!state.openPath || !isTextPath(state.openPath) || !target?.position) return;
+    const { CONTENT_TEXT, CONTENT_EMPTY } = state.monaco.editor.MouseTargetType;
+    // Monaco snaps clicks past the last character to the end of the line.
+    const afterLineText = target.type === CONTENT_EMPTY && target.detail?.isAfterLines === false && target.position.column > 1;
+    if (target.type !== CONTENT_TEXT && !afterLineText) return;
     const browserEvent = event.event?.browserEvent;
     if (browserEvent && Number.isFinite(browserEvent.button) && browserEvent.button !== 0) return;
     const selection = state.editor.getSelection();
     if (selection && !selection.isEmpty()) return;
     const model = state.editor.getModel();
     if (!model) return;
-    const offset = model.getOffsetAt(event.target.position);
+    const offset = model.getOffsetAt(target.position);
     if (state.previewSvgCache?.mode === 'cards') {
       revealVirtualPreviewSource(state.openPath, offset).catch(console.error);
       return;

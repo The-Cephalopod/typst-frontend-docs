@@ -21,7 +21,7 @@ function harness() {
   const testUI = { closed: 0, toasts: [] };
   globalThis.appTest = {
     state, els, github, testUI, syncOpenFileFromEditor, flushEditorSync, resetProjectState, commitChanges, openDiagnosticLocation,
-    route, createNewFile, renameSelectedFile, uploadFiles,
+    route, createNewFile, renameSelectedFile, uploadFiles, handleEditorPreviewClick,
     mockOpenFile: fn => { openFile = fn; },
     mockTextPrompt: fn => { textPrompt = fn; },
   };
@@ -56,6 +56,31 @@ function harness() {
   };
   return { app, window, edit };
 }
+
+test('clicking after the final character reveals that source line in the preview', t => {
+  const { app } = harness();
+  const { state, els, handleEditorPreviewClick } = app;
+  const MouseTargetType = { CONTENT_TEXT: 6, CONTENT_EMPTY: 7, OVERLAY_WIDGET: 10 };
+  const sentence = 'A sentence.';
+  const position = { lineNumber: 1, column: sentence.length + 1 };
+  let reveals = 0;
+  state.monaco = { editor: { MouseTargetType } };
+  state.editor.getSelection = () => ({ isEmpty: () => true });
+  state.editor.getModel = () => ({ getOffsetAt: ({ column }) => column - 1 });
+  els['preview-output'].querySelectorAll = () => [];
+  state.previewSourceAnchors = [{ path: 'main.typ', offset: 0, length: sentence.length, element: {
+    isConnected: true, scrollIntoView: () => { reveals++; }, classList: { add: noop, remove: noop },
+  } }];
+  t.after(() => clearTimeout(state.previewHighlightTimer));
+
+  handleEditorPreviewClick({ target: { type: MouseTargetType.CONTENT_EMPTY, position, detail: { isAfterLines: false } } });
+  assert.equal(reveals, 1);
+
+  handleEditorPreviewClick({ target: { type: MouseTargetType.CONTENT_EMPTY, position, detail: { isAfterLines: true } } });
+  handleEditorPreviewClick({ target: { type: MouseTargetType.CONTENT_EMPTY, position: { lineNumber: 2, column: 1 }, detail: { isAfterLines: false } } });
+  handleEditorPreviewClick({ target: { type: MouseTargetType.OVERLAY_WIDGET, position } });
+  assert.equal(reveals, 1, 'Only clicks next to source text should move the preview.');
+});
 
 test('overlapping sync calls map edits in order and retain the latest promise', async () => {
   const { app, window, edit } = harness();
