@@ -8,6 +8,8 @@ node --check app.js
 node --check typst-worker.js
 node --check grammar-worker.js
 node --check codeberg.js
+node --check working-state.js
+node --check project-tools.js
 ```
 
 The tests evaluate the actual `app.js` in a Node VM with startup disabled, minimal DOM doubles and controlled GitHub, Monaco and Typst responses. They cover shared dependency startup, retries, bounded import discovery, cache isolation, overlapping editor/data loading and cancellation when routes change.
@@ -21,6 +23,10 @@ npm install --no-save playwright
 npx playwright install chromium
 node tests/browser-performance.cjs
 node tests/browser-interactions.cjs
+node tests/browser-fonts.cjs
+node tests/browser-branch-workflow.cjs
+node tests/browser-project-tools.cjs
+node tests/browser-working-state.cjs
 ```
 
 Alternatively set `BROWSER_CHANNEL=msedge` to use an installed Microsoft Edge. The app itself remains dependency-free and needs no build step. Playwright is only a test dependency. The test serves the source on a temporary localhost port and uses a fresh headless browser with the real pinned Monaco/Typst CDN modules and fonts. It does not connect to a GitHub account or modify any repository.
@@ -31,11 +37,22 @@ The fixture is approximately 413 KB of Typst source producing 90 pages. The test
 
 The interaction check also uses the keyboard to switch themes, verifies that both theme buttons reflect the same preference after reload, and checks that switching themes preserves the Monaco model, selection and undo history without scheduling a compile.
 
+`browser-fonts.cjs` uses mocked GitHub branches and blobs with the real Typst worker. It verifies that a repository font changes preview glyph metrics, appears in the exported PDF, can be replaced after a damaged upload, and is isolated by branch. Set `TYPST_REPO_FONT` to a local copy of the Roboto fixture to skip its CDN download.
+
+`browser-branch-workflow.cjs` uses a mocked GitHub API to verify branch creation at the loaded revision, selective commits, draft migration, retry after a failed push or pull request, and the final pull request link. It reloads the browser between retries to exercise stored progress.
+
+`browser-project-tools.cjs` uses mocked GitHub reads to check search across pending and unopened files, selective replacements with stale-match detection, undo in Monaco, and the outline of the preview document and its included sources.
+
+`browser-working-state.cjs` uses mocked GitHub responses and real browser IndexedDB to check autosave recovery, account isolation, stale drafts, partial commits, edits during a push, conflict resolution, and persistent discard.
+
 Optional environment variables:
 
 - `PERF_ARTIFACT_DIR`: save `measurements.json` and `preview.png` in this directory.
 - `TYPST_APP_DIR`: test another extracted source directory.
 - `BASELINE=1`: measure an older version without asserting the new virtualization behavior.
 - `QUICK=1`: skip timing loops while running browser correctness checks.
+- `ENABLE_TEST_DRAFTS=1`: include real IndexedDB autosave in the performance run.
+- `BROWSER_EXECUTABLE`: use a specific installed Chromium executable.
+- `TYPST_CDN_HELPER`: serve a local mirror of the pinned CDN assets through a CommonJS module exposing `staticAssets(req, res)` and `rewrite(body)`.
 
 The typing metric runs from the page's keydown handler to the second animation frame. It is a conservative browser paint proxy, not an operating-system input-to-photon measurement. Preview timing includes Playwright dispatch, the compile deadline, real WASM compilation/SVG rendering, DOM mounting, readiness polling and two animation frames. The browser suite asserts correctness and bounded mounted content, not machine-specific millisecond limits.

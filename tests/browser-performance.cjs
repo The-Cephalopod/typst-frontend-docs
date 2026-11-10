@@ -5,49 +5,62 @@ const assert = require('node:assert/strict');
 const { chromium } = require('playwright');
 const root = path.resolve(process.env.TYPST_APP_DIR || path.join(__dirname, '..'));
 const baseline = process.env.BASELINE === '1';
+const benchmarkDrafts = !baseline && process.env.ENABLE_TEST_DRAFTS === '1';
 const output = process.env.PERF_ARTIFACT_DIR;
 const summary = {};
+const mirror = process.env.TYPST_CDN_HELPER ? require(process.env.TYPST_CDN_HELPER) : null;
 const server = http.createServer((req, res) => {
+  if (mirror?.staticAssets(req, res)) return;
   if (req.url === '/favicon.ico') { res.writeHead(204).end(); return; }
   const file = path.join(root, req.url.split('?')[0] === '/' ? 'index.html' : req.url.split('?')[0]);
   if (!file.startsWith(root) || !fs.existsSync(file)) { res.writeHead(404).end(); return; }
   let body = fs.readFileSync(file);
   if (file.endsWith('app.js')) body = body.toString().replace(/  boot\(\)\.catch\(err => \{[\s\S]*?\n  \}\);\n\}\)\(\);\s*$/, `
     cacheElements();
-    window.testApp = { state, els, ensureMonaco, ensureTypstRuntime, compilePreview, onEditorChanged,
+    window.testApp = { state, els, ensureMonaco, ensureTypstRuntime, compilePreview, onEditorChanged, openFile,
       installPreviewSvg, normalizePreviewSvg, schedulePreviewSourceAnchorIndexing, setPreviewZoom,
       resetProjectState, handlePreviewClick, handleEditorPreviewClick,
+      restoreWorkingDraft: typeof restoreWorkingDraft === 'function' ? restoreWorkingDraft : null,
       revealVirtualPreviewSource: typeof revealVirtualPreviewSource === 'function' ? revealVirtualPreviewSource : null };
   })();`);
   res.setHeader('Content-Type', file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : 'text/html');
-  res.end(body);
+  res.end(mirror ? mirror.rewrite(body.toString()) : body);
 });
 (async () => {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  const browser = await chromium.launch({ ...(process.env.BROWSER_CHANNEL ? { channel: process.env.BROWSER_CHANNEL } : {}), headless: true });
+  const browser = await chromium.launch({
+    ...(process.env.BROWSER_CHANNEL ? { channel: process.env.BROWSER_CHANNEL } : {}),
+    ...(process.env.BROWSER_EXECUTABLE ? { executablePath: process.env.BROWSER_EXECUTABLE } : {}),
+    headless: true,
+  });
   try {
     const page = await browser.newPage({ viewport: { width: 1500, height: 960 } });
     page.on('console', msg => { if (['error', 'warning'].includes(msg.type())) console.log(msg.type(), msg.text().slice(0, 600)); });
     const pageErrors = [];
     page.on('pageerror', error => pageErrors.push(error.stack));
     await page.goto(`http://127.0.0.1:${server.address().port}/`);
-    await page.evaluate(async () => {
-      const { state, els, ensureMonaco, ensureTypstRuntime } = testApp;
+    await page.evaluate(async enableDrafts => {
+      const { state, els, ensureMonaco, ensureTypstRuntime, openFile } = testApp;
       els['home-view'].classList.add('hidden'); els['editor-view'].classList.remove('hidden');
       await Promise.all([ensureMonaco(), ensureTypstRuntime()]);
       state.repo = { owner: { login: 'fixture' }, name: 'project' };
-      state.mainPath = state.openPath = 'main.typ';
+      state.mainPath = 'main.typ';
       state.compilerHydrated = true;
       const source = '#set page(width: 595pt, height: 842pt)\n' + Array.from({ length: 45 }, (_, i) => `= Page ${i+1}\n\n` + 'A sentence for a realistic long document with repeated text. '.repeat(150)).join('\n#pagebreak()\n');
-      state.suppressEditorChange = true;
-      state.editor.setValue(source);
-      state.suppressEditorChange = false;
+      const bytes = new TextEncoder().encode(source);
       state.fileIndex.set('main.typ', { existing: true, size: source.length });
-      state.originalBytes.set('main.typ', new TextEncoder().encode(source));
+      state.fileBytes.set('main.typ', bytes);
+      state.originalBytes.set('main.typ', bytes);
+      if (enableDrafts) {
+        Object.assign(state, { branch: 'main', headSha: 'base', baseTreeSha: 'tree' });
+        state.baseFiles.set('main.typ', { path: 'main.typ', type: 'blob', existing: true, sha: 'base-blob', size: bytes.length });
+        await testApp.restoreWorkingDraft(state.repositoryLoadSerial);
+      }
+      await openFile('main.typ');
       window.longTasks = [];
       new PerformanceObserver(list => longTasks.push(...list.getEntries().map(e => ({ start: e.startTime, duration: e.duration })))).observe({ type: 'longtask', buffered: false });
       testApp.onEditorChanged({});
-    });
+    }, benchmarkDrafts);
     const settled = async () => {
       await page.waitForFunction(() => testApp.state.previewSvgCache && !testApp.state.compileTimer && !testApp.state.compileInFlight &&
         testApp.state.previewSvgCache.pages.some(p => p.group) &&
@@ -73,6 +86,13 @@ const server = http.createServer((req, res) => {
     await page.waitForTimeout(1000);
     summary.typing = await page.evaluate(() => ({ inputTimes, longTasks, status: document.querySelector('#compile-status').textContent, sourceLength: testApp.state.editor.getValue().length }));
     console.log('TYPING', JSON.stringify(summary.typing));
+    if (benchmarkDrafts && !process.env.QUICK) {
+      summary.draft = await page.evaluate(async () => ({
+        revisions: testApp.state.draft?.version,
+        bytes: (await TypstWorkingState.readDraft(testApp.state.draft.scope))?.files[0]?.bytes.length,
+      }));
+      assert(summary.draft.revisions > 1 && summary.draft.bytes > 400000, 'The benchmark must write multiple real IndexedDB drafts.');
+    }
     summary.previewTimes = [];
     for (let i = 0; i < (process.env.QUICK ? 0 : 8); i++) {
       await page.evaluate(() => { window.previewStart = performance.now(); });

@@ -115,7 +115,8 @@
       </div>
 
       <div class="editor-topbar-right">
-        <button id="refresh-repo-btn" class="icon-btn" title="Reload from GitHub">↻</button>
+        <button id="refresh-repo-btn" class="icon-btn" title="Sync with GitHub" aria-label="Sync remote changes">↻</button>
+        <button id="publish-branch-btn" class="secondary-btn slim" disabled>Branch / PR</button>
         <button id="download-pdf-btn" class="secondary-btn slim" disabled>Export PDF</button>
         <button id="commit-btn" class="primary-btn slim" disabled>
           Commit <span id="change-count-badge" class="button-badge hidden">0</span>
@@ -125,7 +126,13 @@
       </div>
     </header>
 
-    <div class="editor-workspace">
+    <nav id="workspace-switcher" class="workspace-switcher" aria-label="Workspace panes">
+      <button type="button" data-workspace-pane="files" aria-controls="file-sidebar" aria-pressed="false">Files</button>
+      <button type="button" data-workspace-pane="editor" aria-controls="code-pane" aria-pressed="true">Editor</button>
+      <button type="button" data-workspace-pane="preview" aria-controls="preview-pane" aria-pressed="false">Preview</button>
+    </nav>
+
+    <div id="editor-workspace" class="editor-workspace" data-pane="editor">
       <aside id="file-sidebar" class="file-sidebar">
         <div class="sidebar-heading">
           <div>
@@ -140,11 +147,41 @@
             <button id="delete-file-btn" class="mini-icon-btn danger-hover" title="Delete selected file">⌫</button>
           </div>
         </div>
-        <div class="sidebar-search">
+        <nav class="project-tool-switcher" aria-label="Project tools">
+          <button type="button" data-project-tool="files" aria-pressed="true" aria-controls="file-tree" aria-label="Browse files">Browse</button>
+          <button type="button" data-project-tool="search" aria-pressed="false" aria-controls="project-search-panel">Search</button>
+          <button type="button" data-project-tool="outline" aria-pressed="false" aria-controls="project-outline-panel">Outline</button>
+        </nav>
+        <div id="file-path-filter" class="sidebar-search">
           <span>⌕</span>
-          <input id="file-search-input" placeholder="Find a file" />
+          <input id="file-search-input" aria-label="Find a file" placeholder="Find a file" />
         </div>
         <div id="file-tree" class="file-tree" role="tree"></div>
+        <section id="project-search-panel" class="project-tool-panel hidden" aria-label="Search project contents">
+          <form id="project-search-form" class="project-search-form">
+            <label for="project-search-query">Find in project</label>
+            <div class="project-search-actions">
+              <input id="project-search-query" class="text-input" type="search" spellcheck="false" maxlength="4096" required />
+              <button type="submit" class="secondary-btn slim">Search</button>
+            </div>
+            <label class="project-check-row"><input id="project-search-case" type="checkbox" /> Match case</label>
+            <label for="project-search-replacement">Replace with</label>
+            <div class="project-search-actions">
+              <input id="project-search-replacement" class="text-input" spellcheck="false" maxlength="4096" />
+              <button id="project-search-preview" type="button" class="secondary-btn slim" disabled>Preview</button>
+            </div>
+            <div class="project-replace-actions">
+              <button id="project-search-select" type="button" class="secondary-btn slim hidden">Clear selection</button>
+              <button id="project-search-apply" type="button" class="primary-btn slim hidden" disabled>Apply selected</button>
+            </div>
+          </form>
+          <p id="project-search-status" class="project-tool-status" role="status">Search the contents of project files.</p>
+          <div id="project-search-results" class="project-tool-results"></div>
+        </section>
+        <section id="project-outline-panel" class="project-tool-panel hidden" aria-label="Document outline">
+          <p id="project-outline-status" class="project-tool-status" role="status"></p>
+          <div id="project-outline-results" class="project-tool-results"></div>
+        </section>
         <div class="sidebar-footer">
           <button id="main-file-btn" class="main-file-btn" title="Choose the document used for preview">
             <span class="main-dot"></span>
@@ -159,17 +196,13 @@
 
       <section id="code-pane" class="code-pane">
         <div class="tabbar">
-          <div id="open-file-tab" class="file-tab active">
-            <span id="tab-file-icon" class="file-type-icon typ">T</span>
-            <span id="tab-file-name">main.typ</span>
-            <span id="tab-dirty-dot" class="dirty-dot hidden">●</span>
-          </div>
-          <div class="tabbar-spacer"></div>
+          <div id="open-file-tabs" class="open-file-tabs" role="group" aria-label="Open files"></div>
           <button id="editor-theme-btn" type="button" class="tab-icon-btn" title="Toggle theme" aria-label="Light theme" aria-pressed="false">☾</button>
           <button id="editor-font-minus" class="tab-icon-btn" title="Decrease editor font size">A−</button>
           <button id="editor-font-plus" class="tab-icon-btn" title="Increase editor font size">A+</button>
         </div>
-        <div id="editor-container" class="editor-container"></div>
+        <div id="editor-container" class="editor-container hidden"></div>
+        <div id="empty-editor" class="empty-editor">Open a file from the Files pane.</div>
         <div id="binary-file-view" class="binary-file-view hidden">
           <div class="binary-icon">◫</div>
           <h3 id="binary-file-name">Binary file</h3>
@@ -225,6 +258,8 @@
         <span id="cursor-position">Ln 1, Col 1</span>
       </div>
       <div class="statusbar-right">
+        <span id="draft-status" aria-live="polite"></span>
+        <button id="discard-draft-btn" class="tab-icon-btn hidden">Discard draft</button>
         <span id="repo-sync-status">GitHub</span>
         <span>UTF-8</span>
         <span>Typst</span>
@@ -276,6 +311,59 @@
       <div class="modal-actions">
         <button class="secondary-btn" data-close-modal>Cancel</button>
         <button id="confirm-commit-btn" class="primary-btn">Commit changes</button>
+      </div>
+    </div>
+
+    <div id="sync-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="sync-title">
+      <div class="modal-header">
+        <div>
+          <span class="modal-kicker">Remote changes</span>
+          <h2 id="sync-title">Resolve sync conflicts</h2>
+        </div>
+        <button class="modal-close" data-close-modal aria-label="Close">×</button>
+      </div>
+      <p>Choose how to combine each conflict. Your working draft stays saved until you apply the resolutions.</p>
+      <div id="sync-conflicts" class="commit-summary"></div>
+      <div id="sync-error" class="inline-error hidden" role="alert"></div>
+      <div class="modal-actions">
+        <button class="secondary-btn" data-close-modal>Resolve later</button>
+        <button id="apply-sync-btn" class="primary-btn">Apply resolutions</button>
+      </div>
+    </div>
+
+    <div id="branch-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="branch-heading">
+      <div class="modal-header">
+        <div>
+          <span class="modal-kicker">Publish changes</span>
+          <h2 id="branch-heading">Branch and pull request</h2>
+        </div>
+        <button class="modal-close" data-close-modal aria-label="Close">×</button>
+      </div>
+      <label class="field-label" for="branch-name">Branch name</label>
+      <input id="branch-name" class="text-input" placeholder="typst/update-document" autocomplete="off" />
+      <label class="branch-check"><input id="branch-current" type="checkbox" /> Use current branch</label>
+      <div id="branch-review">
+        <label class="field-label">Files to commit</label>
+        <div id="branch-files" class="commit-summary"></div>
+        <label class="field-label" for="branch-message">Commit message</label>
+        <input id="branch-message" class="text-input" value="Update Typst project" maxlength="120" />
+      </div>
+      <label class="branch-check"><input id="branch-create-pr" type="checkbox" checked /> Open a pull request</label>
+      <div id="branch-pr-fields">
+        <label class="field-label" for="branch-target">Target branch</label>
+        <input id="branch-target" class="text-input" list="branch-targets" autocomplete="off" />
+        <datalist id="branch-targets"></datalist>
+        <label class="field-label" for="branch-title">Pull request title</label>
+        <input id="branch-title" class="text-input" maxlength="255" />
+        <label class="field-label" for="branch-body">Description</label>
+        <textarea id="branch-body" class="text-input" rows="3"></textarea>
+      </div>
+      <div id="branch-progress" class="branch-progress" aria-live="polite"></div>
+      <div id="branch-error" class="inline-error hidden" role="alert"></div>
+      <div class="modal-actions">
+        <button id="branch-reset-btn" class="secondary-btn hidden">Start another</button>
+        <button class="secondary-btn" data-close-modal>Close</button>
+        <button id="branch-run-btn" class="primary-btn">Continue</button>
       </div>
     </div>
 
@@ -339,6 +427,8 @@
     </div>
   </div>
 
+  <script src="./working-state.js"></script>
+  <script src="./project-tools.js"></script>
   <script src="./app.js"></script>
 </body>
 </html>

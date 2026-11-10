@@ -19,17 +19,21 @@
   const MAX_SINGLE_BLOB_BYTES = 25 * 1024 * 1024;
   const encoder = new TextEncoder();
   const decoder = new TextDecoder('utf-8', { fatal: false });
+  const diffDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+  const MAX_DIFF_BYTES = 2 * 1024 * 1024;
 
   const TEXT_EXTENSIONS = new Set([
     'typ','txt','md','markdown','json','csv','yaml','yml','toml','xml','html','css','js','mjs','cjs','ts','tsx','jsx',
     'py','rs','go','java','c','h','cpp','hpp','sh','ps1','bat','ini','conf','bib','gitignore','gitattributes','lock','svg'
   ]);
   const IMAGE_EXTENSIONS = new Set(['png','jpg','jpeg','gif','webp','svg','bmp','avif']);
-  const FONT_EXTENSIONS = new Set(['ttf','otf','woff','woff2']);
+  const FONT_EXTENSIONS = new Set(['ttf','otf','ttc','otc','woff','woff2']);
   const DATA_EXTENSIONS = new Set(['json','csv','yaml','yml','toml','xml','bib']);
 
   const $ = (id) => document.getElementById(id);
   const els = {};
+  let projectTools;
+  const working = window.TypstWorkingState;
   const state = {
     provider: 'github',
     token: null,
@@ -44,12 +48,21 @@
     headSha: null,
     baseTreeSha: null,
     rawTree: [],
+    baseFiles: new Map(),
     fileIndex: new Map(),
     fileBytes: new Map(),
     fileRequests: new Map(),
     originalBytes: new Map(),
     sourceTextCache: new Map(),
     changes: new Map(),
+    draft: null,
+    workingRevision: 0,
+    editorDraftRevision: -1,
+    syncPlan: null,
+    repositoryOperation: null,
+    commitReview: null,
+    branchReview: null,
+    branchWorkflow: null,
     pathsCache: null,
     typPathsCache: null,
     treeCache: null,
@@ -61,6 +74,8 @@
     shadowSyncPromise: null,
     shadowSyncTail: Promise.resolve(),
     openPath: null,
+    openTabs: new Map(),
+    workspacePreviewScroll: null,
     mainPath: null,
     deletedPaths: new Set(),
     expandedFolders: new Set(),
@@ -69,11 +84,11 @@
     compilerHydrationPromise: null,
     compilerHydrationTail: Promise.resolve(),
     compilerReady: false,
+    fontLoadDiagnostics: [],
     editor: null,
     editorInitPromise: null,
     runtimeInitPromise: null,
     repositoryLoadSerial: 0,
-    editorModel: null,
     suppressEditorChange: false,
     monaco: null,
     grammarEnabled: false,
@@ -148,7 +163,7 @@
     getBranches(owner, repo) { return this.request(`/repos/${enc(owner)}/${enc(repo)}/branches?per_page=100`); }
     getRef(owner, repo, branch) {
       const ref = `heads/${branch.split('/').map(encodeURIComponent).join('/')}`;
-      return this.request(`/repos/${enc(owner)}/${enc(repo)}/git/ref/${ref}`);
+      return this.request(`/repos/${enc(owner)}/${enc(repo)}/git/ref/${ref}`, { cache: 'no-store' });
     }
     getCommit(owner, repo, sha) { return this.request(`/repos/${enc(owner)}/${enc(repo)}/git/commits/${sha}`); }
     getTree(owner, repo, treeSha) { return this.request(`/repos/${enc(owner)}/${enc(repo)}/git/trees/${treeSha}?recursive=1`); }
@@ -174,6 +189,20 @@
         method: 'PATCH', body: { sha, force: false }
       });
     }
+    createBranch(owner, repo, branch, sha) {
+      return this.request(`/repos/${enc(owner)}/${enc(repo)}/git/refs`, {
+        method: 'POST', body: { ref: `refs/heads/${branch}`, sha },
+      });
+    }
+    createPullRequest(owner, repo, head, base, title, body) {
+      return this.request(`/repos/${enc(owner)}/${enc(repo)}/pulls`, {
+        method: 'POST', body: { head, base, title, body },
+      });
+    }
+    async findOpenPullRequest(owner, repo, head, base) {
+      const pulls = await this.request(`/repos/${enc(owner)}/${enc(repo)}/pulls?state=open&head=${enc(owner + ':' + head)}&base=${enc(base)}`, { cache: 'no-store' });
+      return pulls[0];
+    }
     async searchRepos(query) {
       const q = query.trim();
       if (!q && state.token) {
@@ -187,6 +216,7 @@
 
   const github = new GitHubClient(() => state.token);
   let codebergClient, codebergClientPromise;
+  let githubProfileRequest;
   const themeButtons = ['home-theme-btn', 'editor-theme-btn'];
 
   function repositoryProviderLabel(provider = state.provider) {
@@ -292,11 +322,15 @@
       'download-pdf-btn','commit-btn','change-count-badge','grammar-toggle-btn','editor-account-btn','file-count-label','new-file-btn','upload-file-btn','upload-folder-btn',
       'rename-file-btn','delete-file-btn','file-search-input','file-tree','main-file-btn','main-file-label','upload-file-input','upload-folder-input',
       'sidebar-resizer','preview-resizer','code-pane','editor-container','binary-file-view','binary-file-name','binary-file-meta','download-binary-btn',
-      'tab-file-icon','tab-file-name','tab-dirty-dot','editor-theme-btn','editor-font-minus','editor-font-plus','preview-page-label','zoom-out-btn','zoom-reset-btn',
+      'open-file-tabs','empty-editor','editor-workspace','workspace-switcher','editor-theme-btn','editor-font-minus','editor-font-plus','preview-page-label','zoom-out-btn','zoom-reset-btn',
       'zoom-in-btn','fit-preview-btn','preview-scroll','preview-stage','preview-loading','preview-error','preview-error-text','diagnostic-summary','diagnostic-list','preview-output',
       'status-current-file','cursor-position','repo-sync-status','modal-backdrop','auth-modal','auth-modal-title','auth-token-copy','auth-token-help',
       'github-token-input','remember-token-checkbox','auth-error','disconnect-github-btn','save-github-token-btn',
       'commit-modal','commit-modal-title','commit-summary','commit-message-input','commit-error',
+      'draft-status','discard-draft-btn','sync-modal','sync-conflicts','sync-error','apply-sync-btn',
+      'publish-branch-btn','branch-modal','branch-name','branch-target','branch-title','branch-body',
+      'branch-create-pr','branch-progress','branch-error','branch-run-btn','branch-current',
+      'branch-review','branch-files','branch-message','branch-pr-fields','branch-targets','branch-reset-btn',
       'confirm-commit-btn','text-prompt-modal','text-prompt-kicker','text-prompt-title','text-prompt-label','text-prompt-input','text-prompt-error',
       'text-prompt-confirm','main-file-modal','main-file-list','image-paste-modal','image-paste-title','image-paste-destination',
       'image-paste-filename','image-paste-width','image-paste-caption','image-paste-kind-image','image-paste-kind-figure',
@@ -356,13 +390,19 @@
     const token = state.token;
     if (!token) return;
     try {
-      const profile = await github.getProfile(token);
+      const profile = await requestGitHubProfile(token);
       if (state.token !== token) return;
       state.profile = profile;
-    } catch {
-      if (state.token === token) clearToken('github');
+    } catch (error) {
+      if (state.token === token && error.status === 401) clearToken('github');
     }
     updateAccountUI();
+  }
+  function requestGitHubProfile(token) {
+    if (githubProfileRequest?.token !== token) {
+      githubProfileRequest = { token, promise: github.getProfile(token) };
+    }
+    return githubProfileRequest.promise;
   }
   function repositoryToken(provider = state.provider) {
     return provider === 'codeberg' ? state.codebergToken : state.token;
@@ -407,9 +447,21 @@
   }
 
   function bindEvents() {
+    projectTools = window.createProjectTools?.({
+      getScope: () => [state.repositoryLoadSerial, state.fileIndex, state.branch, repositoryToken()],
+      getTextFiles: () => effectivePaths().filter(isTextPath).map(path => ({ path, size: state.fileIndex.get(path)?.size || 0 })),
+      getEntry: () => state.mainPath,
+      readText: readProjectToolText,
+      resolveReference: resolveTypstReference,
+      jump: ({ path, line, column, length }) => openFileAtOffset(path, 0, length, { line, column }),
+      replace: replaceProjectToolMatches,
+      afterReplace: () => scheduleCompile(0),
+      report: toast,
+    });
     window.addEventListener('hashchange', route);
-    window.addEventListener('beforeunload', (e) => {
-      if (state.changes.size) { e.preventDefault(); e.returnValue = ''; }
+    window.addEventListener('pagehide', () => { void persistDraft(); });
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') void persistDraft();
     });
     for (const id of themeButtons) els[id].addEventListener('click', toggleTheme);
     els['grammar-toggle-btn'].addEventListener('click', toggleGrammar);
@@ -425,7 +477,14 @@
     });
     els['repo-title-btn'].addEventListener('click', () => { if (state.repo) window.open(state.repo.html_url, '_blank', 'noopener'); });
     els['branch-select'].addEventListener('change', onBranchChange);
-    els['refresh-repo-btn'].addEventListener('click', () => reloadCurrentRepo(true));
+    els['refresh-repo-btn'].addEventListener('click', syncCurrentRepository);
+    els['discard-draft-btn']?.addEventListener('click', discardWorkingDraft);
+    els['apply-sync-btn']?.addEventListener('click', resolveSyncConflicts);
+    els['publish-branch-btn']?.addEventListener('click', openBranchModal);
+    els['branch-run-btn']?.addEventListener('click', runBranchWorkflow);
+    els['branch-reset-btn']?.addEventListener('click', resetBranchWorkflow);
+    els['branch-create-pr']?.addEventListener('change', updateBranchWorkflowUI);
+    els['branch-current']?.addEventListener('change', updateBranchWorkflowUI);
     els['download-pdf-btn'].addEventListener('click', exportPdf);
     els['commit-btn'].addEventListener('click', openCommitModal);
     els['file-search-input'].addEventListener('input', scheduleFileTreeRender);
@@ -445,11 +504,14 @@
     els['zoom-reset-btn'].addEventListener('click', () => setPreviewZoom(1));
     els['fit-preview-btn'].addEventListener('click', fitPreviewWidth);
     els['save-github-token-btn'].addEventListener('click', connectRepositoryAccount);
-    els['disconnect-github-btn'].addEventListener('click', () => {
+    els['disconnect-github-btn'].addEventListener('click', async () => {
+      const provider = state.authProvider;
+      if (state.repositoryOperation || !await persistDraft()) return;
       state.authAttempt++;
-      clearToken(state.authProvider);
+      clearToken(provider);
       closeModal();
-      toast(`${repositoryProviderLabel(state.authProvider)} account disconnected.`);
+      toast(`${repositoryProviderLabel(provider)} account disconnected.`);
+      await changeDraftAccount(provider, false);
     });
     els['confirm-commit-btn'].addEventListener('click', commitChanges);
     els['text-prompt-confirm'].addEventListener('click', resolveTextPrompt);
@@ -470,22 +532,56 @@
     });
     els['preview-output'].addEventListener('click', handlePreviewClick);
     els['editor-container'].addEventListener('paste', handleEditorImagePaste, true);
+    for (const button of els['workspace-switcher'].querySelectorAll('button')) {
+      button.addEventListener('click', () => setWorkspacePane(button.dataset.workspacePane));
+    }
     setupResizer(els['sidebar-resizer'], 'sidebar');
     setupResizer(els['preview-resizer'], 'preview');
   }
 
+  function setWorkspacePane(pane) {
+    const workspace = els['editor-workspace'];
+    if (!workspace || workspace.dataset.pane === pane) return;
+    const preview = els['preview-scroll'];
+    if (workspace.dataset.pane === 'preview' && preview.clientWidth) {
+      state.workspacePreviewScroll = { top: preview.scrollTop, left: preview.scrollLeft };
+    }
+    workspace.dataset.pane = pane;
+    for (const button of els['workspace-switcher'].querySelectorAll('button')) {
+      button.setAttribute('aria-pressed', String(button.dataset.workspacePane === pane));
+    }
+    if (pane === 'editor') layoutEditor();
+    if (pane === 'preview') {
+      if (state.previewFit) fitPreviewWidth();
+      if (state.workspacePreviewScroll) {
+        preview.scrollTo(state.workspacePreviewScroll);
+        state.workspacePreviewScroll = null;
+      }
+    }
+  }
+
+  function revealEditorPane() {
+    if (isNarrowWorkspace()) setWorkspacePane('editor');
+  }
+
+  function isNarrowWorkspace() {
+    return window.matchMedia?.('(max-width: 960px)').matches;
+  }
+
+  function layoutEditor() {
+    if (!state.editor || els['editor-container'].classList.contains('hidden')) return;
+    const rect = els['editor-container'].getBoundingClientRect();
+    const width = Math.floor(rect.width);
+    const height = Math.floor(rect.height);
+    if (width > 0 && height > 0) state.editor.layout({ width, height });
+  }
 
   function scheduleEditorLayout() {
     if (!state.editor) return;
     if (state.editorLayoutFrame) cancelAnimationFrame(state.editorLayoutFrame);
     state.editorLayoutFrame = requestAnimationFrame(() => {
       state.editorLayoutFrame = 0;
-      if (!state.editor || els['editor-container'].classList.contains('hidden')) return;
-      const rect = els['editor-container'].getBoundingClientRect();
-      const width = Math.floor(rect.width);
-      const height = Math.floor(rect.height);
-      if (width <= 0 || height <= 0) return;
-      state.editor.layout({ width, height });
+      layoutEditor();
     });
   }
 
@@ -548,8 +644,7 @@
     const fontSize = Math.max(11, Math.min(22, Number(localStorage.getItem(STORAGE.fontSize) || 14)));
     document.documentElement.style.setProperty('--editor-font-size', `${fontSize}px`);
     state.editor = state.monaco.editor.create(els['editor-container'], {
-      value: '',
-      language: 'typst',
+      model: null,
       theme: document.documentElement.dataset.theme === 'dark' ? 'typst-dark' : 'typst-light',
       automaticLayout: false,
       minimap: { enabled: false },
@@ -1054,8 +1149,9 @@
   function route() {
     const parsed = parseHash();
     if (parsed?.type === 'repo' && isRepositoryLoaded(parsed.owner, parsed.repo, parsed.branch, parsed.provider)) return;
+    void persistDraft();
     const serial = ++state.repositoryLoadSerial;
-    if (['text-prompt-modal', 'image-paste-modal', 'commit-modal'].includes(state.activeModal)) closeModal();
+    if (['text-prompt-modal', 'image-paste-modal', 'commit-modal', 'sync-modal', 'branch-modal'].includes(state.activeModal)) closeModal();
     if (!parsed || parsed.type === 'home') {
       showHome();
       return;
@@ -1140,11 +1236,12 @@
       state.branch === (requestedBranch || state.repo.default_branch);
   }
 
-  async function openRepository(owner, repo, requestedBranch, serial, provider = 'github') {
-    if (isRepositoryLoaded(owner, repo, requestedBranch, provider)) return;
+  async function openRepository(owner, repo, requestedBranch, serial, provider = 'github', force = false) {
+    if (!force && isRepositoryLoaded(owner, repo, requestedBranch, provider)) return;
     if (serial === undefined) serial = ++state.repositoryLoadSerial;
     resetProjectState();
     state.provider = provider;
+    if (els['editor-workspace']) els['editor-workspace'].inert = true;
     updateAccountUI();
     els['home-view'].classList.add('hidden');
     els['editor-view'].classList.remove('hidden');
@@ -1161,6 +1258,8 @@
 
     const client = provider === 'codeberg' ? await ensureCodebergClient() : repositoryClient(provider);
     if (serial !== state.repositoryLoadSerial) return;
+    const draftAccount = working && typeof indexedDB !== 'undefined' ? identifyDraftAccount() : null;
+    draftAccount?.catch(() => {});
     const meta = await client.getRepo(owner, repo);
     if (serial !== state.repositoryLoadSerial) return;
     state.repo = meta;
@@ -1176,11 +1275,15 @@
     const ref = await client.getRef(owner, repo, state.branch);
     if (serial !== state.repositoryLoadSerial) return;
     if (!await loadTreeAtRef(ref.object.sha, serial, client)) return;
+    await restoreWorkingDraft(serial, draftAccount);
+    if (serial !== state.repositoryLoadSerial) return;
+    if (els['editor-workspace']) els['editor-workspace'].inert = false;
+    updateChangeUI();
     chooseInitialMainFile();
     renderFileTree();
     addRecentProject();
 
-    const openingFile = state.mainPath ? openFile(state.mainPath) : editorReady;
+    const openingFile = state.mainPath ? openFile(state.mainPath, { reveal: false, focus: true }) : editorReady;
     const hydratingFiles = hydrateCompilerFS();
     // Share the main file request and discover dependencies while Monaco loads.
     hydratingFiles.catch(() => {});
@@ -1188,7 +1291,7 @@
     if (serial !== state.repositoryLoadSerial) return;
     if (!state.mainPath) showNoTypstFiles();
 
-    setSyncStatus(`${providerLabel} • ${state.branch}`);
+    setSyncStatus(state.syncPlan ? 'Resolve sync conflicts' : `${providerLabel} • ${state.branch}`);
     hydratingFiles.then(() => {
       if (serial === state.repositoryLoadSerial) scheduleCompile(0);
     }).catch(showCompileError);
@@ -1204,28 +1307,41 @@
     state.headSha = commitSha;
     state.baseTreeSha = commit.tree.sha;
     state.rawTree = tree.tree || [];
-    state.fileIndex.clear();
-    for (const item of state.rawTree) if (item.type === 'blob') state.fileIndex.set(item.path, { ...item, existing: true });
+    state.baseFiles = indexRevision(state.rawTree);
+    state.fileIndex = new Map(state.baseFiles);
     invalidatePathCaches();
     els['file-count-label'].textContent = `${state.fileIndex.size} files`;
     return true;
   }
 
   function resetProjectState() {
+    projectTools?.reset();
+    void persistDraft();
+    state.draft = null;
+    state.workingRevision++;
+    state.editorDraftRevision = -1;
+    state.syncPlan = null;
+    state.repositoryOperation = null;
+    state.commitReview = null;
+    state.branchReview = null;
+    state.branchWorkflow = null;
     clearTimeout(state.compileTimer);
     state.compileTimer = null;
     state.compileDueAt = 0;
     clearTimeout(state.fileTreeRenderTimer);
     clearTimeout(state.editorSyncTimer);
     if (state.grammarEnabled) stopGrammarCheck();
+    resetOpenTabs();
+    state.workspacePreviewScroll = null;
     cancelPreviewSourceAnchorIndexing();
     disposePreviewPages();
     state.repo = null; state.branch = null; state.branches = []; state.headSha = null; state.baseTreeSha = null;
-    state.rawTree = []; state.fileIndex = new Map(); state.fileBytes = new Map(); state.fileRequests = new Map(); state.originalBytes = new Map(); state.sourceTextCache = new Map(); state.changes = new Map();
+    state.rawTree = []; state.baseFiles = new Map(); state.fileIndex = new Map(); state.fileBytes = new Map(); state.fileRequests = new Map(); state.originalBytes = new Map(); state.sourceTextCache = new Map(); state.changes = new Map();
     state.pathsCache = null; state.typPathsCache = null; state.treeCache = null; state.fileTreeRows = new Map(); state.fileTreeRenderTimer = null;
     state.editorSyncTimer = null; state.editorSyncPending = false; state.editorSyncPath = null; state.shadowSyncPromise = null;
     state.openPath = null; state.mainPath = null; state.deletedPaths = new Set(); state.expandedFolders = new Set();
     state.compilerHydrated = false; state.compilerHydrating = false; state.compilerHydrationPromise = null; state.compilerNeedsReset = true;
+    state.fontLoadDiagnostics = [];
     state.compileInFlight = false; state.compileQueued = false; state.compilePromise = null; state.compileSerial++;
     state.diagnostics = []; state.sourceSearchOrder = null; state.previewLastJump = null; state.previewSourceAnchors = []; state.previewAnchorMap = new WeakMap();
     if (state.previewSvgCache?.mode === 'cards') els['preview-output'].style.gap = state.previewSvgCache.previousGap;
@@ -1236,6 +1352,7 @@
     els['preview-error-text'].classList.add('hidden');
     els['preview-loading'].classList.remove('hidden');
     updateChangeUI();
+    showDraftStatus();
   }
 
   function updateRepoHeader() {
@@ -1245,7 +1362,7 @@
     els['repo-private-badge'].classList.toggle('hidden', !r.private);
     const providerLabel = repositoryProviderLabel();
     els['repo-title-btn'].title = `Open ${r.full_name} on ${providerLabel}`;
-    els['refresh-repo-btn'].title = `Reload from ${providerLabel}`;
+    els['refresh-repo-btn'].title = `Sync with ${providerLabel}`;
   }
 
   function renderBranches() {
@@ -1261,47 +1378,606 @@
   async function onBranchChange() {
     const next = els['branch-select'].value;
     if (next === state.branch) return;
-    if (state.changes.size && !confirm('Switch branches and discard your uncommitted changes?')) {
-      els['branch-select'].value = state.branch; return;
-    }
+    if (state.repositoryOperation || !await persistDraft()) { els['branch-select'].value = state.branch; return; }
     location.hash = repoHash(state.provider, state.repo.owner.login, state.repo.name, next);
   }
 
-  async function reloadCurrentRepo(confirmDiscard = false) {
-    if (!state.repo) return;
-    if (confirmDiscard && state.changes.size && !confirm(`Reload from ${repositoryProviderLabel()} and discard your uncommitted changes?`)) return;
-    const owner = state.repo.owner.login, name = state.repo.name, branch = state.branch;
-    await openRepositoryForce(owner, name, branch);
+  let draftWrites = Promise.resolve();
+
+  function indexRevision(tree) {
+    return new Map(tree.filter(item => item.type === 'blob').map(item => [item.path, { ...item, existing: true }]));
   }
 
-  async function openRepositoryForce(owner, repo, branch, provider = state.provider) {
-    const serial = ++state.repositoryLoadSerial;
-    resetProjectState();
-    state.provider = provider;
-    updateAccountUI();
-    setCompileStatus('busy', 'Reloading repository');
-    const client = provider === 'codeberg' ? await ensureCodebergClient() : repositoryClient(provider);
-    if (serial !== state.repositoryLoadSerial) return;
-    const meta = await client.getRepo(owner, repo);
-    if (serial !== state.repositoryLoadSerial) return;
-    state.repo = meta; state.branch = branch || meta.default_branch;
-    updateRepoHeader();
-    const [ref, branches] = await Promise.all([
-      client.getRef(owner, repo, state.branch),
-      client.getBranches(owner, repo).catch(() => [])
-    ]);
-    if (serial !== state.repositoryLoadSerial) return;
-    state.branches = branches;
-    renderBranches();
-    if (!await loadTreeAtRef(ref.object.sha, serial, client)) return;
-    chooseInitialMainFile();
+  function draftScope(account, branch = state.branch) {
+    return JSON.stringify([state.provider, state.repo.owner.login.toLowerCase(), state.repo.name.toLowerCase(), branch, account]);
+  }
+
+  async function identifyDraftAccount() {
+    const { provider, repositoryLoadSerial } = state;
+    const token = repositoryToken(provider);
+    if (!token) return 'anonymous';
+    let profile = provider === 'github' ? state.profile : state.codebergProfile;
+    if (!profile) profile = await (provider === 'github' ? requestGitHubProfile(token) : repositoryClient().getProfile(token)).catch(() => null);
+    if (repositoryLoadSerial !== state.repositoryLoadSerial || token !== repositoryToken(provider)) {
+      throw new Error('The connected project or account changed while opening the draft.');
+    }
+    if (profile) {
+      if (provider === 'codeberg') state.codebergProfile = profile;
+      else state.profile = profile;
+      updateAccountUI();
+      return 'user:' + (profile.id ?? profile.login.toLowerCase());
+    }
+    // Repository-scoped tokens may lack permission to read their account.
+    const digest = await crypto.subtle.digest('SHA-256', encoder.encode(token));
+    return 'connection:' + Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+  }
+
+  function queueDraftSave(path) {
+    const draft = state.draft;
+    if (!draft) return;
+    if (path !== undefined) draft.paths.add(path);
+    if (!draft.timer) draft.timer = setTimeout(() => { void persistDraft(); }, 220);
+  }
+
+  function setWorkingChange(path, change) {
+    if (change) state.changes.set(path, change);
+    else state.changes.delete(path);
+    state.workingRevision++;
+    queueDraftSave(path);
+  }
+
+  function changeForBytes(path, bytes, renameFrom = state.changes.get(path)?.renameFrom) {
+    const meta = state.fileIndex.get(path);
+    if (meta?.existing && !renameFrom && sameBytes(state.originalBytes.get(path), bytes)) return null;
+    return { type: meta?.existing ? 'modify' : 'add', bytes, renameFrom };
+  }
+
+  function captureEditorDraft(path) {
+    if (state.draft && state.editorDraftRevision === state.editRevision && state.fileBytes.has(path) &&
+        !state.changes.get(path)?.pending) return state.fileBytes.get(path);
+    const text = state.editor.getValue();
+    const bytes = encoder.encode(text);
+    state.editorDraftRevision = state.editRevision;
+    state.fileBytes.set(path, bytes);
+    state.sourceTextCache.set(path, text);
+    setWorkingChange(path, changeForBytes(path, bytes));
+    updateChangeUI(path);
+    updateFileTreeDirtyIndicator(path);
+    return bytes;
+  }
+
+  function baseFile(path) {
+    return state.baseFiles.get(path) || (state.fileIndex.get(path)?.existing ? state.fileIndex.get(path) : null);
+  }
+
+  function snapshotWorkingChanges() {
+    return new Map([...state.changes].map(([path, change]) => {
+      const meta = state.fileIndex.get(path);
+      const base = baseFile(path);
+      return [path, {
+        type: change.type, bytes: change.bytes,
+        sha: base?.sha, mode: meta?.mode || '100644',
+        renameFrom: change.renameFrom || meta?.renameFrom,
+        base: base && { path, sha: base.sha, mode: base.mode, size: base.size, type: 'blob', existing: true },
+        baseBytes: state.originalBytes.get(path),
+      }];
+    }));
+  }
+
+  function showDraftStatus(draft = state.draft) {
+    const el = els['draft-status'];
+    if (!el) return;
+    el.textContent = draft?.error ? 'Draft save unavailable' :
+      draft?.savedAt && state.changes.size ? `Draft saved ${new Date(draft.savedAt).toLocaleTimeString()}` : '';
+    el.title = draft?.error || (draft?.savedAt ? new Date(draft.savedAt).toLocaleString() : '');
+  }
+
+  function persistDraft() {
+    const draft = state.draft;
+    if (!draft) return Promise.resolve(true);
+    if (state.editorSyncPending && state.editorSyncPath === state.openPath) captureEditorDraft(state.openPath);
+    clearTimeout(draft.timer);
+    draft.timer = null;
+    if (!draft.paths.size && !draft.headerDirty) return draft.write || Promise.resolve(true);
+    const changes = state.changes;
+    const paths = draft.paths;
+    draft.paths = new Set();
+    draft.headerDirty = false;
+    const updates = [...paths].map(path => {
+      const change = changes.get(path);
+      if (!change) return [path, null];
+      const base = baseFile(path);
+      return [path, {
+        type: change.type, bytes: change.bytes, mode: state.fileIndex.get(path)?.mode,
+        renameFrom: change.renameFrom,
+        base: base && { path, type: 'blob', sha: base.sha, size: base.size, mode: base.mode, existing: true },
+        baseBytes: state.originalBytes.get(path),
+      }];
+    });
+    const header = {
+      scope: draft.scope, headSha: state.headSha, treeSha: state.baseTreeSha, savedAt: Date.now(),
+      workflow: state.branchWorkflow && { ...state.branchWorkflow }, keep: Boolean(changes.size || state.branchWorkflow),
+    };
+    draft.write = draftWrites = draftWrites.then(() => working.writeDraft(header, updates, draft.version || 0, draft.source)).then(version => {
+      draft.version = version;
+      draft.source = null;
+      draft.savedAt = header.keep ? header.savedAt : null;
+      draft.error = '';
+      if (draft === state.draft) showDraftStatus();
+      return true;
+    }, error => {
+      for (const path of paths) draft.paths.add(path);
+      draft.headerDirty = true;
+      draft.error = error.message;
+      if (draft === state.draft) showDraftStatus();
+      return false;
+    });
+    return draft.write;
+  }
+
+  function applyDraftChanges(changes) {
+    state.changes = new Map();
+    state.deletedPaths = new Set();
+    for (const [path, change] of changes) {
+      const base = state.baseFiles.get(path);
+      state.changes.set(path, { type: change.type, bytes: change.bytes, renameFrom: change.renameFrom });
+      if (change.baseBytes) state.originalBytes.set(path, change.baseBytes);
+      if (change.type === 'delete') {
+        state.deletedPaths.add(path);
+        state.fileBytes.delete(path);
+      } else {
+        state.fileIndex.set(path, { ...base, path, type: 'blob', mode: change.mode || base?.mode || '100644',
+          existing: Boolean(base), size: change.bytes.length, bytes: change.bytes, renameFrom: change.renameFrom });
+        state.fileBytes.set(path, change.bytes);
+      }
+      state.sourceTextCache.delete(path);
+    }
+    invalidatePathCaches();
+    state.workingRevision++;
+    updateChangeUI();
+  }
+
+  async function restoreWorkingDraft(serial, accountRequest) {
+    if (!working || typeof indexedDB === 'undefined') return;
+    let draft;
+    try {
+      const account = await (accountRequest || identifyDraftAccount());
+      if (serial !== state.repositoryLoadSerial) return;
+      draft = { account, scope: draftScope(account), paths: new Set() };
+      state.draft = draft;
+      await draftWrites;
+      const saved = await working.readDraft(draft.scope);
+      if (state.draft !== draft || serial !== state.repositoryLoadSerial || !saved) return;
+      state.branchWorkflow = saved.workflow;
+      draft.savedAt = saved.savedAt;
+      draft.version = saved.version;
+      if (!saved.files.length) return;
+      const latest = { sha: state.headSha, treeSha: state.baseTreeSha, tree: state.rawTree, files: state.baseFiles };
+      if (saved.headSha !== latest.sha) {
+        // Retain the original base while the user resolves conflicts. The
+        // saved blob IDs still allow a merge if the old tree is unavailable.
+        const previous = await repositoryClient().getTree(state.repo.owner.login, state.repo.name, saved.treeSha).catch(() => null);
+        if (state.draft !== draft || serial !== state.repositoryLoadSerial) return;
+        const oldTree = Array.isArray(previous?.tree) && !previous.truncated ? previous.tree : latest.tree;
+        state.baseFiles = indexRevision(oldTree);
+        for (const file of saved.files) {
+          if (file.base) state.baseFiles.set(file.path, file.base);
+          else state.baseFiles.delete(file.path);
+        }
+        state.fileIndex = new Map(state.baseFiles);
+        state.rawTree = [...state.baseFiles.values()];
+        state.headSha = saved.headSha;
+        state.baseTreeSha = saved.treeSha;
+      }
+      applyDraftChanges(new Map(saved.files.map(file => [file.path, file])));
+      if (saved.headSha !== latest.sha) await syncToRevision(latest, serial, true);
+      if (state.draft !== draft || serial !== state.repositoryLoadSerial) return;
+      showDraftStatus();
+      toast('Restored your local draft.', 'success');
+    } catch (error) {
+      if (serial !== state.repositoryLoadSerial) return;
+      if (draft) { draft.error = error.message; showDraftStatus(); }
+      toast(`Draft recovery needs attention. ${error.message}`, 'error', 6000);
+    }
+  }
+
+  async function changeDraftAccount(provider, carryAnonymous) {
+    if (state.provider !== provider || !state.headSha || els['editor-view'].classList.contains('hidden')) return;
+    const serial = state.repositoryLoadSerial;
+    const { repo, branch, draft } = state;
+    const operation = {};
+    state.repositoryOperation = operation;
+    updateChangeUI();
+    try {
+      if (draft) {
+        const account = await identifyDraftAccount();
+        if (serial !== state.repositoryLoadSerial || state.draft !== draft) return;
+        if (account === draft.account) return;
+        const scope = draftScope(account);
+        if (carryAnonymous && draft.account === 'anonymous' && state.changes.size) {
+          const existing = await working.readDraft(scope);
+          if (serial !== state.repositoryLoadSerial || state.draft !== draft) return;
+          if (!existing) {
+            if (!await persistDraft() || serial !== state.repositoryLoadSerial || state.draft !== draft) return;
+            state.draft = { account, scope, paths: new Set(state.changes.keys()),
+              source: { scope: draft.scope, version: draft.version || 0 }, headerDirty: true };
+            await persistDraft();
+            return;
+          }
+        }
+      }
+      await openRepository(repo.owner.login, repo.name, branch, undefined, provider, true);
+    } catch (error) {
+      if (serial === state.repositoryLoadSerial) toast(error.message, 'error', 6000);
+    } finally {
+      finishRepositoryOperation(operation);
+    }
+  }
+
+  function currentRepositoryContext() {
+    const { provider, repo, branch, repositoryLoadSerial, fileIndex } = state;
+    const token = repositoryToken(provider);
+    return {
+      provider, owner: repo.owner.login, name: repo.name, branch, client: repositoryClient(provider),
+      isCurrent: () => state.repositoryLoadSerial === repositoryLoadSerial && state.fileIndex === fileIndex &&
+        state.branch === branch && repositoryToken(provider) === token,
+    };
+  }
+
+  async function fetchRevision(context, sha) {
+    const commit = await context.client.getCommit(context.owner, context.name, sha);
+    const result = await context.client.getTree(context.owner, context.name, commit.tree.sha);
+    if (result.truncated) throw new Error('The remote file tree is incomplete. Sync needs a complete tree to preserve your changes.');
+    const tree = result.tree || [];
+    return { sha, treeSha: commit.tree.sha, tree, files: indexRevision(tree) };
+  }
+
+  async function fetchBaseBytes(context, meta) {
+    if (!meta) return undefined;
+    if (meta.size > MAX_SINGLE_BLOB_BYTES) throw new Error(`${meta.path} is too large for a line-by-line comparison.`);
+    const blob = await context.client.getBlob(context.owner, context.name, meta.sha);
+    return base64ToBytes(blob.content);
+  }
+
+  function sameBlob(a, b) {
+    return a === b || Boolean(a && b && a.sha === b.sha);
+  }
+
+  function comparableText(path, ...values) {
+    return isTextPath(path) && values.every(bytes => !bytes || !looksBinary(bytes));
+  }
+
+  function obstructedFiles(tree, changes) {
+    const additions = new Set();
+    for (const [path, change] of changes) if (change.type !== 'delete') additions.add(path);
+    const files = new Set(tree.filter(item => item.type !== 'tree' && changes.get(item.path)?.type !== 'delete').map(item => item.path));
+    const obstructed = new Set();
+    for (const item of tree) if (item.type === 'commit' && additions.has(item.path)) obstructed.add(item.path);
+    for (const path of additions) files.add(path);
+    for (const path of files) {
+      for (let folder = dirname(path); folder; folder = dirname(folder)) {
+        if (additions.has(folder)) obstructed.add(folder);
+        if (additions.has(path) && files.has(folder)) obstructed.add(path);
+      }
+    }
+    return obstructed;
+  }
+
+  async function buildSyncPlan(latest, snapshot, context) {
+    const base = state.baseFiles;
+    const remote = latest.files;
+    const moves = working.remoteMoves(base, remote);
+    const groups = working.changeGroups(snapshot);
+    const obstructed = obstructedFiles(latest.tree, snapshot);
+    const entries = new Map();
+    await pooled(groups, 4, async group => {
+      const { path, from } = group;
+      const local = snapshot.get(path);
+      const movedTo = moves.get(from || path);
+      const previous = base.get(path), next = remote.get(path);
+      const keep = new Map(group.paths.map(key => [key, snapshot.get(key)]));
+      if (movedTo && movedTo !== path && !snapshot.has(movedTo)) {
+        keep.set(movedTo, { type: 'delete' });
+        if (local.type !== 'delete') keep.set(path, { ...local, renameFrom: movedTo });
+      }
+      const entry = { group, keep };
+      entries.set(path, entry);
+      if (obstructed.has(path)) {
+        entry.conflict = 'Remote files occupy this path. Use remote, or resolve later and rename the local file before syncing.';
+        entry.remoteOnly = true;
+        return;
+      }
+      if (from && movedTo === path) {
+        keep.delete(from);
+        entry.remoteBytes = snapshot.get(from).baseBytes;
+        keep.set(path, { ...local, renameFrom: undefined, baseBytes: entry.remoteBytes });
+        return;
+      }
+      if (!movedTo && sameBlob(previous, next) && (!from || sameBlob(base.get(from), remote.get(from)))) return;
+      if (!from && local.type === 'delete' && !next && !movedTo) { keep.clear(); return; }
+
+      const conflict = from || movedTo ? 'Rename conflict' :
+        !next || local.type === 'delete' ? 'Delete conflict' : 'Both sides changed this file';
+      entry.conflict = movedTo ? `${conflict} · Remote moved to ${movedTo}` : conflict;
+      if (from && !remote.has(from) && next && next.size === local.bytes?.length && next.size <= MAX_DIFF_BYTES) {
+        const theirs = await fetchBaseBytes(context, next).catch(() => null);
+        if (sameBytes(local.bytes, theirs)) { keep.clear(); entry.conflict = null; return; }
+        entry.remoteBytes = theirs;
+      }
+      if (!from && next && local.bytes) {
+        if (!comparableText(path, local.bytes, local.baseBytes)) entry.conflict = 'Binary conflict';
+        // Large or non-text rewrites can use whole-file choices.
+        if (Math.max(previous?.size || 0, local.bytes.length, next.size || 0) > MAX_DIFF_BYTES) return;
+        try {
+          const [before, theirs] = await Promise.all([
+            local.baseBytes || fetchBaseBytes(context, previous), fetchBaseBytes(context, next),
+          ]);
+          if (sameBytes(local.bytes, theirs)) { keep.clear(); entry.conflict = null; return; }
+          entry.remoteBytes = theirs;
+          keep.set(path, { ...local, baseBytes: theirs });
+          if (!comparableText(path, before, local.bytes, theirs)) {
+            entry.conflict = 'Binary conflict';
+            return;
+          }
+          let baseText, localText, remoteText;
+          try {
+            baseText = before ? diffDecoder.decode(before) : '';
+            localText = diffDecoder.decode(local.bytes);
+            remoteText = diffDecoder.decode(theirs);
+          } catch {
+            entry.conflict = 'Binary or non-UTF-8 conflict';
+            return;
+          }
+          const merged = before ? working.mergeText(baseText, localText, remoteText) : null;
+          if (merged !== null) {
+            if (merged === remoteText) keep.clear();
+            else keep.set(path, { ...local, bytes: encoder.encode(merged), baseBytes: theirs });
+            entry.conflict = null;
+          } else entry.text = { base: baseText, local: localText, remote: remoteText };
+        } catch (error) {
+          entry.conflict += ` · ${error.message}`;
+        }
+      }
+    });
+    return { latest, entries: groups.map(group => entries.get(group.path)), moves };
+  }
+
+  async function syncToRevision(latest, serial, initial = false) {
+    const context = currentRepositoryContext();
+    const revision = state.workingRevision;
+    const edit = state.editRevision;
+    const plan = await buildSyncPlan(latest, snapshotWorkingChanges(), context);
+    if (!context.isCurrent() || serial !== state.repositoryLoadSerial) return;
+    if (revision !== state.workingRevision || edit !== state.editRevision) {
+      throw new Error('The draft changed while syncing. Sync again to include those edits.');
+    }
+    Object.assign(plan, { revision, edit });
+    if (plan.entries.some(entry => entry.conflict)) {
+      state.syncPlan = plan;
+      updateChangeUI();
+      openSyncResolution(plan);
+    } else {
+      await installSyncPlan(plan, new Map(), initial);
+      if (!initial && serial === state.repositoryLoadSerial) toast('Synced the branch and kept your working changes.', 'success');
+    }
+  }
+
+  async function syncCurrentRepository() {
+    if (!state.repo || !state.headSha || state.repositoryOperation || els['editor-workspace']?.inert) return;
+    const context = currentRepositoryContext();
+    const operation = {};
+    state.repositoryOperation = operation;
+    updateChangeUI();
+    setSyncStatus(`Checking ${repositoryProviderLabel()}…`);
+    try {
+      await flushEditorSync();
+      const ref = await context.client.getRef(context.owner, context.name, context.branch);
+      if (!context.isCurrent()) return;
+      if (ref.object.sha === state.headSha) {
+        state.syncPlan = null;
+        toast('This branch is up to date.');
+        return;
+      }
+      const latest = await fetchRevision(context, ref.object.sha);
+      if (!context.isCurrent()) return;
+      await syncToRevision(latest, state.repositoryLoadSerial);
+    } catch (error) {
+      if (context.isCurrent()) toast(error.message, 'error', 6000);
+    } finally {
+      finishRepositoryOperation(operation);
+    }
+  }
+
+  function finishRepositoryOperation(operation) {
+    if (state.repositoryOperation !== operation) return;
+    state.repositoryOperation = null;
+    updateChangeUI();
+    setSyncStatus(state.syncPlan ? 'Resolve sync conflicts' : `${repositoryProviderLabel()} • ${state.branch}`);
+  }
+
+  function openSyncResolution(plan) {
+    const list = els['sync-conflicts'];
+    list.replaceChildren();
+    for (const entry of plan.entries.filter(item => item.conflict)) {
+      const block = document.createElement('section');
+      block.className = 'sync-conflict';
+      const title = document.createElement('strong');
+      title.textContent = entry.group.from ? `${entry.group.from} → ${entry.group.path}` : entry.group.path;
+      const explanation = document.createElement('p');
+      explanation.textContent = entry.conflict;
+      const choice = document.createElement('select');
+      choice.className = 'text-input';
+      choice.setAttribute('aria-label', `Resolve ${entry.group.path}`);
+      choice.append(new Option('Choose a resolution', ''));
+      if (!entry.remoteOnly) choice.append(new Option('Keep local changes', 'local'));
+      choice.append(new Option('Use remote version', 'remote'));
+      entry.choice = choice;
+      block.append(title, explanation, choice);
+      if (entry.text) {
+        choice.append(new Option('Edit merged text', 'manual'));
+        const details = document.createElement('details');
+        const summary = document.createElement('summary');
+        summary.textContent = 'Compare original, local, and remote text';
+        details.append(summary);
+        details.addEventListener('toggle', () => {
+          if (!details.open || details.children.length > 1) return;
+          for (const [label, text] of Object.entries(entry.text)) {
+            const caption = document.createElement('strong');
+            caption.textContent = label;
+            const pre = document.createElement('pre');
+            pre.textContent = text;
+            details.append(caption, pre);
+          }
+        });
+        const input = document.createElement('textarea');
+        input.className = 'text-input hidden';
+        input.setAttribute('aria-label', `Merged text for ${entry.group.path}`);
+        input.rows = 8;
+        entry.input = input;
+        choice.addEventListener('change', () => {
+          input.classList.toggle('hidden', choice.value !== 'manual');
+          if (choice.value === 'manual' && !entry.manualStarted) {
+            entry.manualStarted = true;
+            input.value = entry.text.local;
+          }
+        });
+        block.append(details, input);
+      }
+      list.append(block);
+    }
+    els['sync-error'].classList.add('hidden');
+    openModal('sync-modal');
+    setSyncStatus('Resolve sync conflicts');
+  }
+
+  async function resolveSyncConflicts() {
+    const plan = state.syncPlan;
+    if (!plan || state.repositoryOperation) return;
+    if (plan.revision !== state.workingRevision || plan.edit !== state.editRevision) {
+      return showInlineError(els['sync-error'], 'The draft changed. Run Sync again before applying these choices.');
+    }
+    const choices = new Map();
+    for (const entry of plan.entries) {
+      if (!entry.conflict) continue;
+      const choice = entry.choice.value;
+      if (!choice) return showInlineError(els['sync-error'], 'Choose a resolution for each conflict.');
+      choices.set(entry.group.path, { choice, text: entry.input?.value });
+    }
+    const operation = {};
+    state.repositoryOperation = operation;
+    updateChangeUI();
+    try {
+      await installSyncPlan(plan, choices);
+      if (state.repositoryOperation === operation) {
+        if (state.activeModal === 'sync-modal') closeModal();
+        toast('Applied sync resolutions.', 'success');
+      }
+    } catch (error) {
+      if (state.repositoryOperation === operation) showInlineError(els['sync-error'], error.message);
+    } finally {
+      finishRepositoryOperation(operation);
+    }
+  }
+
+  async function installSyncPlan(plan, choices, initial = false) {
+    const { latest, entries, moves } = plan;
+    const nextChanges = new Map();
+    for (const entry of entries) {
+      const decision = choices.get(entry.group.path);
+      if (decision?.choice === 'remote') continue;
+      for (const [path, change] of entry.keep) {
+        const base = latest.files.get(path);
+        const manual = decision?.choice === 'manual' && path === entry.group.path;
+        const bytes = manual ? encoder.encode(decision.text) : change.bytes;
+        const original = sameBlob(base, state.baseFiles.get(path)) ? change.baseBytes :
+          (path === entry.group.path ? entry.remoteBytes : undefined);
+        if (change.type === 'delete' ? !base : !change.renameFrom && sameBytes(bytes, original)) continue;
+        nextChanges.set(path, { ...change, bytes, baseBytes: original, mode: base?.mode || change.mode,
+          type: change.type === 'delete' ? 'delete' : base ? 'modify' : 'add',
+          renameFrom: latest.files.has(change.renameFrom) ? change.renameFrom : undefined });
+      }
+    }
+    const changedPaths = new Set();
+    const [obstruction] = obstructedFiles(latest.tree, nextChanges);
+    if (obstruction) throw new Error(`The chosen resolutions conflict at ${obstruction}. Rename the local file or choose the remote version.`);
+    for (const path of new Set([...state.baseFiles.keys(), ...latest.files.keys(), ...state.changes.keys(), ...nextChanges.keys()])) {
+      const wasDeleted = state.deletedPaths.has(path);
+      const now = nextChanges.get(path);
+      const nextBase = latest.files.get(path);
+      const isDeleted = now?.type === 'delete' || (!now && !nextBase);
+      const working = state.changes.get(path);
+      const unchanged = wasDeleted === isDeleted && (isDeleted ||
+        (now ? sameBytes(now.bytes, working?.bytes) : !working && sameBlob(state.baseFiles.get(path), nextBase)));
+      if (!unchanged) changedPaths.add(path);
+      if (!sameBlob(state.baseFiles.get(path), nextBase)) state.originalBytes.delete(path);
+    }
+    const dirtyPaths = new Set([...state.changes.keys(), ...nextChanges.keys()]);
+    for (const path of changedPaths) {
+      state.fileBytes.delete(path);
+      state.sourceTextCache.delete(path);
+    }
+    // New map identity cancels in-flight blob loads and preview hydration.
+    state.headSha = latest.sha;
+    state.baseTreeSha = latest.treeSha;
+    state.rawTree = latest.tree;
+    state.baseFiles = latest.files;
+    state.fileIndex = new Map(latest.files);
+    state.fileRequests = new Map();
+    state.syncPlan = null;
+    state.editRevision++;
+    state.compilerNeedsReset = true;
+    state.compilerHydrated = false;
+    state.compilerHydrationPromise = null;
+    state.compileSerial++;
+    applyDraftChanges(nextChanges);
+    if (state.draft) {
+      state.draft.headerDirty = true;
+      for (const path of dirtyPaths) state.draft.paths.add(path);
+      void persistDraft();
+    }
+    if (initial) return;
+    const serial = state.repositoryLoadSerial;
+    const index = state.fileIndex;
+    if (!state.mainPath || !index.has(state.mainPath) || state.deletedPaths.has(state.mainPath)) {
+      const moved = moves.get(state.mainPath);
+      if (moved && index.has(moved) && !state.deletedPaths.has(moved)) state.mainPath = moved;
+      else chooseInitialMainFile();
+    }
+    els['main-file-label'].textContent = state.mainPath || 'Choose file';
     renderFileTree();
-    addRecentProject();
-    if (state.mainPath) await openFile(state.mainPath);
-    if (serial !== state.repositoryLoadSerial) return;
-    setSyncStatus(`${repositoryProviderLabel(provider)} • ${state.branch}`);
-    await hydrateCompilerFS();
-    await compilePreview();
+    if (state.editor) state.editor.updateOptions({ readOnly: true });
+    try {
+      for (const [from, to] of moves) if (!index.has(from) && index.has(to) && !state.deletedPaths.has(to)) renameOpenTab(from, to);
+      await reconcileOpenTabs(changedPaths);
+      if (serial !== state.repositoryLoadSerial || index !== state.fileIndex) return;
+      if (!state.openPath && state.mainPath) await openFile(state.mainPath);
+    } finally {
+      if (serial === state.repositoryLoadSerial && index === state.fileIndex) state.editor?.updateOptions({ readOnly: false });
+    }
+    if (serial !== state.repositoryLoadSerial || index !== state.fileIndex) return;
+    if (!state.mainPath) showNoTypstFiles();
+    else scheduleCompile(0);
+  }
+
+  async function discardWorkingDraft() {
+    if (!state.changes.size || state.repositoryOperation || !confirm('Discard all uncommitted changes in this branch’s local draft?')) return;
+    const operation = {};
+    state.repositoryOperation = operation;
+    updateChangeUI();
+    try {
+      await flushEditorSync();
+      if (state.repositoryOperation !== operation) return;
+      const latest = state.syncPlan?.latest || { sha: state.headSha, treeSha: state.baseTreeSha, tree: state.rawTree, files: state.baseFiles };
+      await installSyncPlan({ latest, entries: [], moves: new Map() }, new Map());
+      if (state.repositoryOperation === operation) {
+        if (!await persistDraft()) throw new Error('The working copy was reset, but the browser could not remove the saved draft.');
+        toast('Discarded the local draft.', 'success');
+      }
+    } catch (error) {
+      if (state.repositoryOperation === operation) toast(error.message, 'error');
+    } finally {
+      finishRepositoryOperation(operation);
+    }
   }
 
   function chooseInitialMainFile() {
@@ -1315,11 +1991,7 @@
   }
 
   function showNoTypstFiles() {
-    state.openPath = null;
-    state.suppressEditorChange = true;
-    state.editor.setValue('// No .typ files found in this repository.\n// Create one with the + button in the Files panel.');
-    state.suppressEditorChange = false;
-    els['tab-file-name'].textContent = 'No Typst file';
+    projectTools?.scheduleOutline();
     els['preview-loading'].classList.add('hidden');
     els['preview-error'].classList.remove('hidden');
     els['diagnostic-summary'].textContent = 'No Typst file';
@@ -1426,9 +2098,7 @@
     const changed = state.changes.has(path);
     row.innerHTML = `<span class="chevron"></span><span class="file-type-icon ${icon.cls}">${icon.label}</span><span class="file-label">${escapeHtml(flat ? path : basename(path))}</span>${changed ? '<span class="tree-dirty">●</span>' : ''}`;
     row.title = path;
-    row.addEventListener('click', () => openFile(path).catch(err => {
-      if (err?.name !== 'AbortError') toast(err.message,'error');
-    }));
+    row.addEventListener('click', () => openFile(path).catch(reportFileError));
     return row;
   }
 
@@ -1522,13 +2192,10 @@
     if (!meta.existing && meta.bytes) {
       state.fileBytes.set(path, meta.bytes); return meta.bytes;
     }
-    if (meta.size > MAX_SINGLE_BLOB_BYTES) throw new Error(`${path} is too large to load in this editor (${formatBytes(meta.size)}).`);
     const requests = state.fileRequests;
     const fileIndex = state.fileIndex;
-    const { owner, name } = state.repo;
-    const client = repositoryClient();
     const request = (async () => {
-      const blob = await client.getBlob(owner.login, name, meta.sha);
+      const blob = await requestRepositoryBlob(path, meta);
       // A late response must not populate a different project or replaced file.
       if (state.fileRequests !== requests || state.fileIndex !== fileIndex || fileIndex.get(path) !== meta) {
         const error = new Error('Project changed while loading a file.');
@@ -1555,9 +2222,90 @@
     return TEXT_EXTENSIONS.has(e) || e === '';
   }
 
+  function requestRepositoryBlob(path, meta) {
+    if (meta.size > MAX_SINGLE_BLOB_BYTES) {
+      throw new Error(`${path} is too large to load in this editor (${formatBytes(meta.size)}).`);
+    }
+    const { owner, name } = state.repo;
+    return repositoryClient().getBlob(owner.login, name, meta.sha);
+  }
+
+  function projectToolText(path, bytes, meta) {
+    if (looksBinary(bytes)) return null;
+    const editing = state.editorSyncPending && state.editorSyncPath === path && state.openPath === path;
+    const text = editing ? state.editor.getValue() : (state.sourceTextCache.get(path) ?? decoder.decode(bytes));
+    if (!editing && text.includes('\uFFFD')) {
+      // A lossy decode would corrupt unrelated bytes during a replacement.
+      try { diffDecoder.decode(bytes); }
+      catch { return null; }
+    }
+    return { text, revision: editing ? text : (state.changes.has(path) ? bytes : (meta.sha ?? meta)) };
+  }
+
+  async function readProjectToolText(path) {
+    const meta = state.fileIndex.get(path);
+    if (!meta || state.deletedPaths.has(path) || !isTextPath(path)) return null;
+    const { repositoryLoadSerial: serial, fileIndex } = state;
+    // Reuse cached/opening files without retaining every project-wide read.
+    let bytes = state.fileBytes.get(path);
+    if (!bytes) {
+      if (state.fileRequests.has(path)) bytes = await getFileBytes(path);
+      else {
+        const blob = await requestRepositoryBlob(path, meta);
+        assertCurrentRepository(serial, fileIndex);
+        bytes = state.fileBytes.get(path) || base64ToBytes(blob.content);
+      }
+    }
+    assertCurrentRepository(serial, fileIndex);
+    if (state.deletedPaths.has(path) || fileIndex.get(path) !== meta) return null;
+    return projectToolText(path, state.fileBytes.get(path) || bytes, meta);
+  }
+
+  async function replaceProjectToolMatches(path, revision, matches, replacement, isCurrent) {
+    const meta = state.fileIndex.get(path);
+    if (!meta || state.deletedPaths.has(path)) return 0;
+    const bytes = await getFileBytes(path);
+    if (!isCurrent() || state.deletedPaths.has(path) || state.fileIndex.get(path) !== meta) return 0;
+    const workingBytes = state.fileBytes.get(path) || bytes;
+    const snapshot = projectToolText(path, workingBytes, meta);
+    if (!snapshot || (snapshot.revision !== revision && snapshot.text !== revision)) return 0;
+    const current = matches.filter(({ offset, value }) => snapshot.text.startsWith(value, offset) && value !== replacement);
+    if (!current.length) return 0;
+
+    if (state.openPath === path && state.editor?.getModel() && !els['editor-container'].classList.contains('hidden')) {
+      const model = state.editor.getModel();
+      const edits = [];
+      for (const { line, column, value } of current) {
+        const range = new state.monaco.Range(line, column, line, column + value.length);
+        if (model.getValueInRange(range) === value) edits.push({ range, text: replacement });
+      }
+      if (!edits.length) return 0;
+      state.editor.pushUndoStop();
+      const applied = state.editor.executeEdits('project-replace', edits);
+      state.editor.pushUndoStop();
+      return applied ? edits.length : 0;
+    }
+
+    const chunks = [];
+    if (workingBytes[0] === 0xef && workingBytes[1] === 0xbb && workingBytes[2] === 0xbf) chunks.push('\uFEFF');
+    let previousEnd = 0;
+    for (const { offset, value } of current) {
+      chunks.push(snapshot.text.slice(previousEnd, offset), replacement);
+      previousEnd = offset + value.length;
+    }
+    chunks.push(snapshot.text.slice(previousEnd));
+    const writing = setWorkingFile(path, encoder.encode(chunks.join('')));
+    // Working state is installed before the worker's asynchronous shadow write.
+    updateChangeUI();
+    updateFileTreeDirtyIndicator(path);
+    state.sourceSearchOrder = null;
+    await writing;
+    return current.length;
+  }
+
   let fileOpenRequest = 0;
 
-  async function openFile(path) {
+  async function openFile(path, { reveal = true, focus = reveal } = {}) {
     const serial = state.repositoryLoadSerial;
     const fileIndex = state.fileIndex;
     if (state.deletedPaths.has(path)) return;
@@ -1571,40 +2319,222 @@
       await syncOpenFileFromEditor();
       if (!isCurrent()) return;
     }
-    const currentBytes = state.fileBytes.get(path) || bytes;
-    state.openPath = path;
-    if (state.grammarEnabled) {
-      clearGrammarMarkers();
-      scheduleGrammarCheck();
+    if (reveal) revealEditorPane();
+    const visible = !isNarrowWorkspace() || els['editor-workspace'].dataset.pane === 'editor';
+    activateFileTab(path, state.fileBytes.get(path) || bytes, focus && visible);
+  }
+
+  function addFileTab(path) {
+    const element = document.createElement('div');
+    element.className = 'file-tab';
+    element.innerHTML = `
+      <button type="button" class="file-tab-open">
+        <span class="file-type-icon" aria-hidden="true"></span>
+        <span class="file-tab-name"></span>
+        <span class="dirty-dot hidden" aria-hidden="true">●</span>
+      </button>
+      <button type="button" class="file-tab-close">×</button>`;
+    const [open, close] = element.children;
+    const [icon, name, dot] = open.children;
+    const tab = { path, element, open, close, icon, name, dot, model: null, viewState: null, dirty: null };
+    tab.open.addEventListener('click', () => openFile(tab.path).catch(reportFileError));
+    tab.close.addEventListener('click', () => closeFileTab(tab.path).catch(reportFileError));
+    setTabPath(tab, path);
+    els['open-file-tabs'].appendChild(element);
+    state.openTabs.set(path, tab);
+    return tab;
+  }
+
+  function reportFileError(err) {
+    if (err?.name !== 'AbortError') toast(err.message, 'error');
+  }
+
+  function setTabPath(tab, path) {
+    const icon = fileIcon(path);
+    tab.path = path;
+    tab.dirty = null;
+    tab.open.title = path;
+    tab.icon.className = `file-type-icon ${icon.cls}`;
+    tab.icon.textContent = icon.label;
+    tab.name.textContent = basename(path);
+    tab.close.setAttribute('aria-label', `Close ${path}`);
+    tab.close.title = `Close ${path}`;
+  }
+
+  function setTabSelected(tab, selected) {
+    if (!tab) return;
+    tab.element.classList.toggle('active', selected);
+    tab.open.setAttribute('aria-pressed', String(selected));
+  }
+
+  function activateFileTab(path, bytes, focus = true) {
+    const previous = state.openTabs.get(state.openPath);
+    const tab = state.openTabs.get(path) || addFileTab(path);
+    const switching = previous !== tab || state.editor.getModel() !== tab.model;
+    if (switching && previous?.model && previous.model === state.editor.getModel()) {
+      previous.viewState = state.editor.saveViewState();
     }
+    if (switching) setTabSelected(previous, false);
+    state.openPath = path;
+    setTabSelected(tab, true);
+    if (focus) tab.element.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     const expanded = expandParents(path);
     if (expanded) renderFileTree();
     else updateFileTreeSelection(path);
     els['status-current-file'].textContent = path;
-    els['tab-file-name'].textContent = basename(path);
-    const icon = fileIcon(path);
-    els['tab-file-icon'].className = `file-type-icon ${icon.cls}`;
-    els['tab-file-icon'].textContent = icon.label;
-    updateDirtyTab();
+    els['empty-editor'].classList.add('hidden');
+    updateDirtyTab(path);
 
-    if (!isTextPath(path) || looksBinary(currentBytes)) {
-      els['editor-container'].classList.add('hidden');
-      els['binary-file-view'].classList.remove('hidden');
+    const binary = !isTextPath(path) || looksBinary(bytes);
+    const oldModel = tab.model;
+    if (binary) {
+      tab.model = null;
+      tab.viewState = null;
       els['binary-file-name'].textContent = basename(path);
-      els['binary-file-meta'].textContent = `${formatBytes(currentBytes.length)} • ${ext(path).toUpperCase() || 'binary'} file`;
-      return;
+      els['binary-file-meta'].textContent = `${formatBytes(bytes.length)} • ${ext(path).toUpperCase() || 'binary'} file`;
+      els['cursor-position'].textContent = '';
+    } else if (!tab.model) {
+      tab.model = state.monaco.editor.createModel(sourceText(path), editorLanguage(path));
     }
-    els['binary-file-view'].classList.add('hidden');
-    els['editor-container'].classList.remove('hidden');
-    const text = sourceText(path) || decoder.decode(currentBytes);
-    state.suppressEditorChange = true;
-    state.editor.setValue(text);
-    const language = ext(path) === 'typ' ? 'typst' : languageForPath(path);
-    state.monaco.editor.setModelLanguage(state.editor.getModel(), language);
-    state.suppressEditorChange = false;
+    els['binary-file-view'].classList.toggle('hidden', !binary);
+    els['editor-container'].classList.toggle('hidden', binary);
+    if (state.editor.getModel() !== tab.model) state.editor.setModel(tab.model);
+    if (oldModel && !tab.model) oldModel.dispose();
+    if (state.grammarEnabled) {
+      clearGrammarMarkers();
+      scheduleGrammarCheck();
+    }
+    if (binary) return;
     applyDiagnosticMarkersForOpenFile();
-    settleEditorLayout(true);
-    state.editor.focus();
+    if (switching && tab.viewState) state.editor.restoreViewState(tab.viewState);
+    const position = state.editor.getPosition();
+    els['cursor-position'].textContent = `Ln ${position.lineNumber}, Col ${position.column}`;
+    settleEditorLayout(switching && !tab.viewState);
+    if (focus) state.editor.focus();
+  }
+
+  function editorLanguage(path) {
+    return ext(path) === 'typ' ? 'typst' : languageForPath(path);
+  }
+
+  function showEmptyEditor() {
+    state.openPath = null;
+    if (els['status-current-file']) els['status-current-file'].textContent = 'No file open';
+    if (els['cursor-position']) els['cursor-position'].textContent = '';
+    els['editor-container']?.classList.add('hidden');
+    els['binary-file-view']?.classList.add('hidden');
+    els['empty-editor']?.classList.remove('hidden');
+  }
+
+  function resetOpenTabs() {
+    state.editor?.setModel?.(null);
+    state.editor?.updateOptions?.({ readOnly: false });
+    for (const tab of state.openTabs.values()) tab.model?.dispose();
+    state.openTabs.clear();
+    els['open-file-tabs']?.replaceChildren();
+    showEmptyEditor();
+  }
+
+  function removeOpenTab(path) {
+    const tab = state.openTabs.get(path);
+    if (!tab) return;
+    if (path === state.openPath) {
+      if (state.grammarEnabled) stopGrammarCheck();
+      state.editor.setModel(null);
+      showEmptyEditor();
+      updateFileTreeSelection(null);
+    }
+    state.openTabs.delete(path);
+    tab.element.remove();
+    tab.model?.dispose();
+  }
+
+  async function closeFileTab(path) {
+    const tab = state.openTabs.get(path);
+    const serial = state.repositoryLoadSerial;
+    if (!tab) return;
+    const paths = [...state.openTabs.keys()];
+    const index = paths.indexOf(path);
+    if (state.openPath === path) await flushEditorSync();
+    if (serial !== state.repositoryLoadSerial || tab !== state.openTabs.get(path)) return;
+    const active = state.openPath === path;
+    if (active) ++fileOpenRequest;
+    removeOpenTab(path);
+    const next = paths[index + 1] || paths[index - 1];
+    if (active && next && state.openTabs.has(next)) await openFile(next);
+  }
+
+  function renameOpenTab(from, to) {
+    const tab = state.openTabs.get(from);
+    if (!tab || from === to) return;
+    if (state.openTabs.has(to)) {
+      if (state.openPath !== from) {
+        removeOpenTab(from);
+        return;
+      }
+      removeOpenTab(to);
+    }
+    setTabPath(tab, to);
+    // Retain insertion order so the keyboard order and close fallback agree.
+    state.openTabs = new Map([...state.openTabs].map(([path, entry]) => [path === from ? to : path, entry]));
+    if (state.openPath === from) state.openPath = to;
+    if (tab.model) state.monaco.editor.setModelLanguage(tab.model, editorLanguage(to));
+    updateDirtyTab(to);
+  }
+
+  function updateTabContents(path, bytes) {
+    const tab = state.openTabs.get(path);
+    if (!tab) return;
+    const active = state.openPath === path;
+    const model = tab.model;
+    if (model && isTextPath(path) && !looksBinary(bytes)) {
+      // Monaco normalizes to one EOL per model. Preserve history when a
+      // repository update changes only the physical line separators.
+      const text = decoder.decode(bytes).replace(/\r\n|\r|\n/g, model.getEOL());
+      if (text === model.getValue()) return;
+      const viewState = active ? state.editor.saveViewState() : null;
+      state.suppressEditorChange = true;
+      try {
+        model.pushStackElement();
+        model.pushEditOperations([], [{ range: model.getFullModelRange(), text }], () => null);
+        model.pushStackElement();
+      } finally {
+        state.suppressEditorChange = false;
+      }
+      if (viewState) state.editor.restoreViewState(viewState);
+      if (active && state.grammarEnabled) scheduleGrammarCheck();
+    } else if (active) {
+      activateFileTab(path, bytes, false);
+    } else if (model) {
+      tab.model = null;
+      tab.viewState = null;
+      model.dispose();
+    }
+  }
+
+  async function reconcileOpenTabs(changedPaths) {
+    const { repositoryLoadSerial: serial, fileIndex, openPath } = state;
+    const refresh = [];
+    for (const [path, tab] of state.openTabs) {
+      if (!fileIndex.has(path) || state.deletedPaths.has(path)) removeOpenTab(path);
+      else if (changedPaths.has(path)) refresh.push([path, tab]);
+    }
+    await pooled(refresh, 4, async ([path, tab]) => {
+      const current = () => serial === state.repositoryLoadSerial && fileIndex === state.fileIndex && state.openTabs.get(path) === tab;
+      try {
+        const bytes = await getFileBytes(path);
+        if (current()) updateTabContents(path, bytes);
+      } catch (error) {
+        if (!current() || error.name === 'AbortError') return;
+        // The draft is still in the working state. Close the stale model so
+        // the user can reopen this file to retry fetching the new revision.
+        removeOpenTab(path);
+        reportFileError(error);
+      }
+    });
+    if (serial !== state.repositoryLoadSerial || fileIndex !== state.fileIndex) return;
+    const next = state.openTabs.keys().next().value;
+    if (openPath && !state.openPath && next) await openFile(next, { reveal: false });
   }
 
   function looksBinary(bytes) {
@@ -1629,7 +2559,7 @@
     if (!state.changes.has(path)) {
       state.changes.set(path, { type: meta?.existing ? 'modify' : 'add', pending: true });
       // Dirty-state DOM only changes on the first edit, not on every keystroke.
-      updateChangeUI();
+      updateChangeUI(path);
       updateFileTreeDirtyIndicator(path, true);
     }
 
@@ -1645,6 +2575,7 @@
     // Publish completed snapshots while typing, then compile the newest edit.
     // Cancelling every in-flight result would starve a long document's preview.
     state.editRevision++;
+    queueDraftSave(path);
     releasePreviewNavigationPage(true);
     cancelPreviewSourceAnchorIndexing();
     if (state.previewSourceAnchors.length) {
@@ -1675,18 +2606,7 @@
     state.editorSyncTimer = null;
     state.editorSyncPending = false;
 
-    const text = state.editor.getValue();
-    const bytes = encoder.encode(text);
-    state.fileBytes.set(path, bytes);
-    state.sourceTextCache.set(path, text);
-
-    const original = state.originalBytes.get(path);
-    const meta = state.fileIndex.get(path);
-    if (meta?.existing && original && sameBytes(bytes, original)) state.changes.delete(path);
-    else state.changes.set(path, { type: meta?.existing ? 'modify' : 'add', bytes });
-
-    updateChangeUI();
-    updateFileTreeDirtyIndicator(path);
+    const bytes = captureEditorDraft(path);
 
     if (window.$typst) {
       const runtime = window.$typst;
@@ -1727,15 +2647,31 @@
     }
   }
 
-  function updateChangeUI() {
+  function updateChangeUI(path = null) {
     const count = state.changes.size;
-    els['commit-btn'].disabled = count === 0;
+    const blocked = Boolean(state.repositoryOperation || els['editor-workspace']?.inert);
+    els['commit-btn'].disabled = count === 0 || Boolean(state.syncPlan) || blocked;
     els['change-count-badge'].classList.toggle('hidden', count === 0);
     els['change-count-badge'].textContent = count;
-    updateDirtyTab();
+    updateDirtyTab(path);
+    if (els['refresh-repo-btn']) els['refresh-repo-btn'].disabled = !state.headSha || blocked;
+    if (els['publish-branch-btn']) els['publish-branch-btn'].disabled = !state.headSha || Boolean(state.syncPlan) || blocked;
+    if (els['discard-draft-btn']) {
+      els['discard-draft-btn'].classList.toggle('hidden', count === 0);
+      els['discard-draft-btn'].disabled = blocked;
+    }
   }
-  function updateDirtyTab() {
-    els['tab-dirty-dot'].classList.toggle('hidden', !state.openPath || !state.changes.has(state.openPath));
+  function updateDirtyTab(path = null) {
+    const setDirty = (tab, tabPath) => {
+      if (!tab) return;
+      const dirty = state.changes.has(tabPath);
+      if (dirty === tab.dirty) return;
+      tab.dirty = dirty;
+      tab.dot.classList.toggle('hidden', !dirty);
+      tab.open.setAttribute('aria-label', dirty ? `${tabPath}, uncommitted changes` : tabPath);
+    };
+    if (path) setDirty(state.openTabs.get(path), path);
+    else state.openTabs.forEach(setDirty);
   }
 
   async function hydrateCompilerFS(force = false) {
@@ -1753,9 +2689,15 @@
       state.compilerHydrating = true;
       try {
         setCompileStatus('busy', 'Loading project files');
-        const entries = [...fileIndex.entries()].filter(([path, meta]) =>
-          !state.deletedPaths.has(path) && (meta.size || 0) <= MAX_SINGLE_BLOB_BYTES
-        );
+        const fontLoadDiagnostics = [];
+        const entries = [...fileIndex.entries()].filter(([path, meta]) => {
+          if (state.deletedPaths.has(path)) return false;
+          if ((meta.size || 0) <= MAX_SINGLE_BLOB_BYTES) return true;
+          if (FONT_EXTENSIONS.has(ext(path))) fontLoadDiagnostics.push({
+            path, severity: 'warning', message: 'Could not load repository font. Use a font file under 25 MB.',
+          });
+          return false;
+        });
         const allTotal = entries.reduce((sum, [, meta]) => sum + (meta.size || 0), 0);
         // Repository reads can run before WASM is ready. Await resets separately so
         // a failed dependency read never releases the shadow-FS write queue.
@@ -1788,15 +2730,25 @@
         }
 
         let done = 0;
-        const mappedPaths = new Set();
+        const mappedPaths = new Map();
         await pooled(selected, 8, async ([path]) => {
           checkCurrent();
-          const bytes = await getFileBytes(path);
+          let bytes;
+          try { bytes = await getFileBytes(path); }
+          catch (error) {
+            checkCurrent();
+            if (!FONT_EXTENSIONS.has(ext(path))) throw error;
+            if (error?.name !== 'AbortError') fontLoadDiagnostics.push({
+              path, severity: 'warning', message: `Could not download repository font. ${error?.message || ''} Check the file and reopen the project to retry.`,
+            });
+          }
           checkCurrent();
-          const mapped = await window.$typst.mapShadow(`/repo/${path}`, bytes);
-          checkCurrent();
-          if (mapped === false) throw new Error(`Typst could not map project file: ${path}`);
-          mappedPaths.add(path);
+          if (bytes) {
+            const mapped = await window.$typst.mapShadow(`/repo/${path}`, bytes);
+            checkCurrent();
+            if (mapped === false) throw new Error(`Typst could not map project file: ${path}`);
+            mappedPaths.set(path, bytes);
+          }
           done++;
           if (done % 8 === 0 || done === selected.length) {
             setCompileStatus('busy', `Loading files ${done}/${selected.length}`);
@@ -1807,7 +2759,7 @@
         for (const [path, change] of state.changes) {
           checkCurrent();
           if (change.type === 'delete') await window.$typst.unmapShadow(`/repo/${path}`);
-          else if (!mappedPaths.has(path) && change.bytes) {
+          else if (change.bytes && mappedPaths.get(path) !== change.bytes) {
             const mapped = await window.$typst.mapShadow(`/repo/${path}`, change.bytes);
             checkCurrent();
             if (mapped === false) throw new Error(`Typst could not map changed file: ${path}`);
@@ -1815,6 +2767,7 @@
           checkCurrent();
         }
 
+        state.fontLoadDiagnostics = fontLoadDiagnostics;
         state.compilerHydrated = true;
         setCompileStatus('busy', 'Compiling');
       } catch (err) {
@@ -1866,8 +2819,7 @@
 
     addPath(state.mainPath);
 
-    // Repo fonts are inexpensive to discover and can be referenced by future
-    // font-registration support without requiring a second full hydration.
+    // Font family selection happens in Typst and need not reference a path.
     for (const [path] of entries) if (FONT_EXTENSIONS.has(ext(path))) addPath(path);
 
     while (typQueue.length) {
@@ -1932,6 +2884,7 @@
   function waitForTypstRuntime() { return ensureTypstRuntime(); }
 
   function scheduleCompile(delay = 16) {
+    projectTools?.scheduleOutline();
     if (!state.mainPath || els['editor-view'].classList.contains('hidden')) return;
     if (state.compileInFlight) {
       state.compileQueued = true;
@@ -2028,6 +2981,11 @@
 
     if (!isCurrent()) return;
     const diagnostics = normalizeDiagnostics(result?.diagnostics || []);
+    for (const diagnostic of state.fontLoadDiagnostics) {
+      if (!state.deletedPaths.has(diagnostic.path) && !state.changes.has(diagnostic.path)) {
+        diagnostics.push(normalizeDiagnostic(diagnostic));
+      }
+    }
     const errors = diagnostics.filter(d => d.severity === 'error');
     const warnings = diagnostics.filter(d => d.severity === 'warning');
     const hasPreview = typeof result?.svg === 'string' || result?.svgParts || result?.result;
@@ -2313,6 +3271,7 @@
     }
     if (serial !== state.repositoryLoadSerial || state.openPath !== path ||
         !isTextPath(path) || els['editor-container'].classList.contains('hidden')) return;
+    revealEditorPane();
     const range = diagnosticRangeForModel(diag, state.editor.getModel());
     if (range) {
       state.editor.setSelection(range);
@@ -2838,16 +3797,7 @@
     if (previous && !state.deletedPaths.has(clean)) return toast('A file already exists at that path.','error');
     const initial = ext(clean) === 'typ' ? '= New document\n\nStart writing here.\n' : '';
     const bytes = encoder.encode(initial);
-    const existing = Boolean(previous?.existing);
-    state.fileIndex.set(clean, { ...previous, path:clean, type:'blob', mode:previous?.mode || '100644', size:bytes.length, existing, bytes });
-    invalidatePathCaches();
-    state.fileBytes.set(clean, bytes);
-    state.sourceTextCache.set(clean, initial);
-    if (existing && sameBytes(state.originalBytes.get(clean), bytes)) state.changes.delete(clean);
-    else state.changes.set(clean, { type:existing ? 'modify' : 'add', bytes });
-    state.deletedPaths.delete(clean);
-    expandParents(clean);
-    if (window.$typst) await window.$typst.mapShadow(`/repo/${clean}`, bytes);
+    await setWorkingFile(clean, bytes);
     if (serial !== state.repositoryLoadSerial) return;
     if (!state.mainPath && ext(clean) === 'typ') { state.mainPath = clean; els['main-file-label'].textContent = clean; }
     renderFileTree(); updateChangeUI(); await openFile(clean);
@@ -2856,7 +3806,11 @@
 
   async function setWorkingFile(path, bytes) {
     const serial = state.repositoryLoadSerial;
-    const clean = normalizeRepoPath(path);
+    const clean = state.fileIndex.has(path) ? path : normalizeRepoPath(path);
+    if (state.editorSyncPath === clean && (state.editorSyncPending || state.shadowSyncPromise)) {
+      await flushEditorSync();
+      if (serial !== state.repositoryLoadSerial) return;
+    }
     const previous = state.fileIndex.get(clean);
     const existing = Boolean(previous?.existing);
     state.fileIndex.set(clean, {
@@ -2871,10 +3825,9 @@
     invalidatePathCaches();
     state.fileBytes.set(clean, bytes);
     state.sourceTextCache.delete(clean);
-    const original = state.originalBytes.get(clean);
-    if (existing && original && sameBytes(bytes, original)) state.changes.delete(clean);
-    else state.changes.set(clean, { type: existing ? 'modify' : 'add', bytes });
+    setWorkingChange(clean, changeForBytes(clean, bytes));
     state.deletedPaths.delete(clean);
+    updateTabContents(clean, bytes);
     if (window.$typst && shouldHydratePriority(clean)) {
       const mapped = await window.$typst.mapShadow(`/repo/${clean}`, bytes);
       if (serial !== state.repositoryLoadSerial) return;
@@ -3040,19 +3993,29 @@
     const files = imageItems.map(item => item.getAsFile()).filter(Boolean);
     if (!files.length) return;
     const serial = state.repositoryLoadSerial;
+    const sourcePath = state.openPath;
+    const sourceModel = state.editor.getModel();
+    const sourceIsActive = () => serial === state.repositoryLoadSerial && state.openPath === sourcePath &&
+      state.editor.getModel() === sourceModel;
     const snippets = [];
     let created = 0;
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const options = await imagePastePrompt(file, i, files.length);
-      if (serial !== state.repositoryLoadSerial) return;
+      if (!sourceIsActive()) return;
       if (!options) break;
       const bytes = new Uint8Array(await file.arrayBuffer());
-      if (serial !== state.repositoryLoadSerial) return;
+      if (!sourceIsActive()) return;
       const path = uniquePastedImagePath(options.filename);
       await setWorkingFile(path, bytes);
       if (serial !== state.repositoryLoadSerial) return;
-      const relative = relativeProjectPath(dirname(state.openPath), path);
+      if (!sourceIsActive()) {
+        renderFileTree();
+        updateChangeUI();
+        toast(`Saved ${path}. Reopen ${sourcePath} to insert it.`);
+        return;
+      }
+      const relative = relativeProjectPath(dirname(sourcePath), path);
       snippets.push(pastedImageSnippet(relative, options));
       created++;
     }
@@ -3408,7 +4371,7 @@
 
   function handleEditorPreviewClick(event) {
     const target = event?.target;
-    if (!state.openPath || !isTextPath(state.openPath) || !target?.position) return;
+    if (!state.openPath || !isTextPath(state.openPath) || !target?.position || isNarrowWorkspace()) return;
     const { CONTENT_TEXT, CONTENT_EMPTY } = state.monaco.editor.MouseTargetType;
     // Monaco snaps clicks past the last character to the end of the line.
     const afterLineText = target.type === CONTENT_EMPTY && target.detail?.isAfterLines === false && target.position.column > 1;
@@ -3494,19 +4457,19 @@
     scrollPreviewToAnchor({ element });
   }
 
-  async function openFileAtOffset(path, offset, length = 0) {
+  async function openFileAtOffset(path, offset, length = 0, location = null) {
     if (!path || !state.fileIndex.has(path) || state.deletedPaths.has(path)) return false;
     const repositorySerial = state.repositoryLoadSerial;
-    // Replacing the current model erases undo history and resets its viewport.
-    // A jump within the open file needs only a new selection and scroll target.
     if (state.openPath !== path || !state.editor?.getModel() || els['editor-container'].classList.contains('hidden')) {
       await openFile(path);
     }
     if (repositorySerial !== state.repositoryLoadSerial || state.openPath !== path) return false;
-    if (!isTextPath(path)) return true;
+    revealEditorPane();
     const model = state.editor.getModel();
+    if (!model) return true;
     const max = model.getValueLength();
-    const start = Math.max(0, Math.min(max, Number(offset) || 0));
+    const start = location ? model.getOffsetAt({ lineNumber: location.line, column: location.column }) :
+      Math.max(0, Math.min(max, Number(offset) || 0));
     const end = Math.max(start, Math.min(max, start + Math.max(0, Number(length) || 0)));
     const startPos = model.getPositionAt(start);
     const endPos = model.getPositionAt(end);
@@ -3549,31 +4512,54 @@
     const destination = state.fileIndex.get(newPath);
     if (destination && !state.deletedPaths.has(newPath)) return toast('A file already exists at that path.','error');
     const oldMeta = state.fileIndex.get(oldPath);
+    const previousMove = state.changes.get(oldPath)?.renameFrom;
     if (oldMeta?.existing) {
-      state.changes.set(oldPath, { type:'delete' }); state.deletedPaths.add(oldPath); state.sourceTextCache.delete(oldPath);
+      setWorkingChange(oldPath, { type:'delete' }); state.deletedPaths.add(oldPath); state.sourceTextCache.delete(oldPath);
     } else {
-      state.changes.delete(oldPath); state.fileIndex.delete(oldPath); state.fileBytes.delete(oldPath); state.sourceTextCache.delete(oldPath);
+      setWorkingChange(oldPath, null); state.fileIndex.delete(oldPath); state.fileBytes.delete(oldPath); state.sourceTextCache.delete(oldPath);
     }
     const existing = Boolean(destination?.existing);
-    const renameFrom = existing ? undefined : (oldMeta?.existing ? oldPath : oldMeta?.renameFrom);
+    const source = previousMove || (oldMeta?.existing ? oldPath : undefined);
+    const renameFrom = source === newPath ? undefined : source;
     state.fileIndex.set(newPath, {
       ...destination, path:newPath, type:'blob', mode:destination?.mode || oldMeta?.mode || '100644',
-      size:bytes.length, existing, bytes, renameFrom,
+      size:bytes.length, existing, bytes, renameFrom: existing ? undefined : renameFrom,
     });
     invalidatePathCaches();
     state.fileBytes.set(newPath, bytes);
     state.sourceTextCache.delete(newPath);
-    if (existing && sameBytes(state.originalBytes.get(newPath), bytes)) state.changes.delete(newPath);
-    else state.changes.set(newPath, { type:existing ? 'modify' : 'add', bytes });
+    setWorkingChange(newPath, changeForBytes(newPath, bytes, renameFrom || null));
     state.deletedPaths.delete(newPath);
+    renameOpenTab(oldPath, newPath);
+    if (state.openPath === newPath) activateFileTab(newPath, bytes);
     if (state.mainPath === oldPath) { state.mainPath = newPath; els['main-file-label'].textContent = newPath; }
-    if (window.$typst) {
-      await window.$typst.unmapShadow(`/repo/${oldPath}`);
-      if (serial !== state.repositoryLoadSerial) return;
-      await window.$typst.mapShadow(`/repo/${newPath}`, bytes);
-      if (serial !== state.repositoryLoadSerial) return;
+    expandParents(newPath);
+    renderFileTree();
+    updateChangeUI();
+    const runtime = window.$typst;
+    if (runtime) {
+      const fileIndex = state.fileIndex;
+      // Edits to the renamed tab may arrive while the old path is unmapping.
+      // Queue the whole move before any newer snapshot for the destination.
+      const sync = state.shadowSyncTail.then(async () => {
+        assertCurrentRepository(serial, fileIndex);
+        await runtime.unmapShadow(`/repo/${oldPath}`);
+        assertCurrentRepository(serial, fileIndex);
+        const mapped = await runtime.mapShadow(`/repo/${newPath}`, bytes);
+        if (mapped === false) throw new Error(`Typst could not map project file: ${newPath}`);
+      });
+      state.shadowSyncTail = sync.catch(() => {});
+      state.shadowSyncPromise = sync;
+      try {
+        await sync;
+      } catch (error) {
+        reportFileError(error);
+      } finally {
+        if (state.shadowSyncPromise === sync) state.shadowSyncPromise = null;
+      }
     }
-    expandParents(newPath); renderFileTree(); updateChangeUI(); await openFile(newPath);
+    if (serial !== state.repositoryLoadSerial) return;
+    if (state.openPath === oldPath) await openFile(newPath);
     if (serial === state.repositoryLoadSerial) scheduleCompile(100);
   }
 
@@ -3585,18 +4571,21 @@
     if (!confirm(`Delete ${path} from the next commit?`)) return;
     const meta = state.fileIndex.get(path);
     if (meta?.existing) {
-      state.changes.set(path, { type:'delete' }); state.deletedPaths.add(path); state.sourceTextCache.delete(path);
+      setWorkingChange(path, { type:'delete' }); state.deletedPaths.add(path); state.sourceTextCache.delete(path);
     } else {
-      state.changes.delete(path); state.fileIndex.delete(path); state.fileBytes.delete(path); state.sourceTextCache.delete(path);
+      setWorkingChange(path, null); state.fileIndex.delete(path); state.fileBytes.delete(path); state.sourceTextCache.delete(path);
     }
+    removeOpenTab(path);
+    if (state.openPath === path) showEmptyEditor();
+    const opening = fileOpenRequest;
     invalidatePathCaches();
     if (window.$typst) await window.$typst.unmapShadow(`/repo/${path}`);
     if (serial !== state.repositoryLoadSerial) return;
     if (state.mainPath === path) chooseInitialMainFile();
-    const next = state.mainPath || effectivePaths()[0] || null;
-    state.openPath = null;
+    const next = state.openTabs.keys().next().value || state.mainPath || effectivePaths()[0] || null;
     renderFileTree(); updateChangeUI();
-    if (next) await openFile(next); else showNoTypstFiles();
+    if (next && !state.openPath && opening === fileOpenRequest) await openFile(next);
+    if (!state.mainPath) showNoTypstFiles();
     if (serial === state.repositoryLoadSerial) scheduleCompile(100);
   }
 
@@ -3630,76 +4619,399 @@
     settleEditorLayout();
   }
 
-  function openCommitModal() {
-    if (!state.changes.size) return;
+  async function openCommitModal() {
+    if (!state.changes.size || state.repositoryOperation || state.syncPlan) return;
     const label = repositoryProviderLabel();
     if (!repositoryToken()) { openAuthModal(); toast(`Connect ${label} before committing changes.`, 'error'); return; }
-    els['commit-modal-title'].textContent = `Commit to ${label}`;
-    els['commit-summary'].innerHTML = '';
-    for (const [path, change] of [...state.changes.entries()].sort(([a],[b])=>a.localeCompare(b))) {
-      const row = document.createElement('div'); row.className = 'commit-summary-row';
-      row.innerHTML = `<span class="truncate">${escapeHtml(path)}</span><span class="change-type ${change.type}">${change.type}</span>`;
-      els['commit-summary'].appendChild(row);
+    const context = currentRepositoryContext();
+    try {
+      await flushEditorSync();
+      if (!context.isCurrent() || state.repositoryOperation || !state.changes.size) return;
+      els['commit-modal-title'].textContent = `Commit to ${label}`;
+      const review = renderCommitReview(els['commit-summary'], context);
+      state.commitReview = review;
+      els['commit-message-input'].value = review.groups.length === 1 ? `Update ${basename(review.groups[0].path)}` : 'Update Typst project';
+      els['commit-error'].classList.add('hidden');
+      openModal('commit-modal');
+      setTimeout(() => { if (state.activeModal === 'commit-modal') els['commit-message-input'].focus(); }, 40);
+    } catch (error) {
+      if (context.isCurrent()) toast(error.message, 'error');
     }
-    els['commit-message-input'].value = state.changes.size === 1 ? `Update ${basename([...state.changes.keys()][0])}` : 'Update Typst project';
-    els['commit-error'].classList.add('hidden');
-    openModal('commit-modal');
-    setTimeout(() => els['commit-message-input'].focus(), 40);
+  }
+
+  function renderCommitReview(container, context, checked) {
+    const snapshot = snapshotWorkingChanges();
+    const groups = working.changeGroups(snapshot);
+    container.replaceChildren();
+    for (const group of groups) {
+      const row = document.createElement('section');
+      row.className = 'commit-file';
+      const label = document.createElement('label');
+      label.className = 'commit-summary-row';
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.checked = checked ? checked.has(group.path) : true;
+      group.checkbox = box;
+      const name = document.createElement('span');
+      name.textContent = group.from ? `${group.from} → ${group.path}` : group.path;
+      const badge = document.createElement('span');
+      badge.className = `change-type ${group.type}`;
+      const item = snapshot.get(group.path);
+      const binary = !comparableText(group.path, item.bytes) || (group.from && !isTextPath(group.from));
+      badge.textContent = binary ? `${group.type} · binary` : group.type;
+      label.append(box, name, badge);
+      row.append(label);
+      const diff = document.createElement('details');
+      const summary = document.createElement('summary');
+      summary.textContent = binary ? 'File details' : 'View diff';
+      const output = document.createElement('div');
+      output.className = 'commit-diff';
+      diff.append(summary, output);
+      diff.addEventListener('toggle', async () => {
+        if (!diff.open || diff.dataset.loaded) return;
+        diff.dataset.loaded = 'true';
+        output.textContent = 'Loading base file…';
+        try {
+          await renderFileDiff(output, group, snapshot, context);
+        } catch (error) {
+          output.textContent = error.message;
+          delete diff.dataset.loaded;
+        }
+      });
+      row.append(diff);
+      container.append(row);
+    }
+    return { snapshot, groups, revision: state.workingRevision, edit: state.editRevision };
+  }
+
+  async function renderFileDiff(output, { path, from, type }, snapshot, context) {
+    const change = snapshot.get(path);
+    const original = snapshot.get(from || path);
+    const after = change.bytes;
+    if (!comparableText(path, after, original.baseBytes) || (from && !isTextPath(from))) {
+      const beforeSize = original.base?.size ?? original.baseBytes?.length;
+      output.textContent = `${beforeSize === undefined ? 'No original file' : formatBytes(beforeSize)} → ${after ? formatBytes(after.length) : 'deleted'}`;
+      return;
+    }
+    if (Math.max(original.base?.size || 0, after?.length || 0) > MAX_DIFF_BYTES) {
+      output.textContent = 'File exceeds the 2 MB line diff limit.';
+      return;
+    }
+    const before = original.baseBytes || await fetchBaseBytes(context, original.base);
+    if (!context.isCurrent() || !output.isConnected) return;
+    let beforeText, afterText;
+    try {
+      if (comparableText(path, before, after)) {
+        beforeText = before ? diffDecoder.decode(before) : '';
+        afterText = after ? diffDecoder.decode(after) : '';
+      }
+    } catch { /* Non-UTF-8 files receive a byte summary. */ }
+    if (afterText === undefined) {
+      output.textContent = `Binary file · ${before ? formatBytes(before.length) : 'new'} → ${after ? formatBytes(after.length) : 'deleted'}`;
+      return;
+    }
+    const oldLines = working.splitLines(beforeText);
+    const newLines = working.splitLines(afterText);
+    const hunks = working.lineHunks(oldLines, newLines);
+    output.replaceChildren();
+    if (!hunks.length) { output.textContent = type === 'rename' ? 'Contents unchanged.' : 'No content differences.'; return; }
+    let index = 0, offset = 0, delta = 0, stage = 0;
+    const more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'tab-icon-btn';
+    more.textContent = 'Show more lines';
+    const renderPage = () => {
+      const pre = document.createElement('pre');
+      let remaining = 400;
+      const line = (content, style) => {
+        const span = document.createElement('span');
+        span.className = style;
+        span.textContent = content.endsWith('\n') ? content : content + '\n';
+        pre.append(span);
+        remaining--;
+      };
+      while (index < hunks.length && remaining > 0) {
+        const hunk = hunks[index];
+        if (stage === 0) {
+          line(`@@ -${hunk.start + 1},${hunk.end - hunk.start} +${hunk.start + 1 + delta},${hunk.lines.length} @@`, 'diff-location');
+          stage = 1;
+        }
+        const removed = hunk.end - hunk.start;
+        while (offset < removed && remaining > 0) line('- ' + oldLines[hunk.start + offset++], 'diff-removed');
+        while (offset < removed + hunk.lines.length && remaining > 0) line('+ ' + hunk.lines[offset++ - removed], 'diff-added');
+        if (offset === removed + hunk.lines.length) {
+          delta += hunk.lines.length - removed;
+          index++; offset = 0; stage = 0;
+        }
+      }
+      output.insertBefore(pre, more);
+      more.hidden = index >= hunks.length;
+    };
+    more.addEventListener('click', renderPage);
+    output.append(more);
+    renderPage();
+  }
+
+  function selectedCommitFiles(review) {
+    if (!review) return snapshotWorkingChanges();
+    if (review.revision !== state.workingRevision || review.edit !== state.editRevision) {
+      throw new Error('The draft changed after review. Reopen the dialog to review the latest changes.');
+    }
+    return new Map(review.groups.filter(group => group.checkbox.checked).flatMap(group =>
+      group.paths.map(path => [path, review.snapshot.get(path)])));
+  }
+
+  async function publishCommit(context, message, snapshot, workflow) {
+    const { provider, owner, name: repo, branch, isCurrent } = context;
+    const { headSha, baseTreeSha } = state;
+    const [obstruction] = obstructedFiles(state.rawTree, snapshot);
+    if (obstruction) throw new Error(`${obstruction} overlaps a tracked file or folder. Review the selected deletions or rename this file.`);
+    const result = provider === 'codeberg'
+      ? await context.client.commitFiles(owner, repo, branch, message, headSha, snapshot, isCurrent)
+      : await commitGitHubFiles({ owner, repo, branch, headSha, baseTreeSha }, message, snapshot, isCurrent);
+    if (!isCurrent() || !result) return null;
+    const branchAdvanced = result.parentSha && result.parentSha !== headSha;
+    if (!branchAdvanced) {
+      state.headSha = result.sha;
+      state.baseTreeSha = result.treeSha;
+    }
+    acceptCommittedFiles(result.treeEntries, snapshot);
+    if (workflow) workflow.committed = result.sha;
+    if (state.draft) {
+      state.draft.headerDirty = true;
+      void persistDraft();
+    }
+    const success = `Committed ${snapshot.size} change${snapshot.size === 1 ? '' : 's'} to ${branch}.`;
+    toast(branchAdvanced ? `${success} Sync to pick up other changes to this branch.` : success, 'success', 5000);
+    return result;
   }
 
   async function commitChanges() {
     const message = els['commit-message-input'].value.trim();
-    if (!message) return showInlineError(els['commit-error'],'Enter a commit message.');
+    if (!message) return showInlineError(els['commit-error'], 'Enter a commit message.');
     const btn = els['confirm-commit-btn'];
-    if (btn.disabled || !state.repo) return;
-    const { repo: repository, provider, branch, headSha, baseTreeSha, repositoryLoadSerial, fileIndex } = state;
-    const { owner: { login: owner }, name: repo } = repository;
-    const isCurrent = () => repositoryLoadSerial === state.repositoryLoadSerial && fileIndex === state.fileIndex;
-    const oldText = btn.textContent; btn.disabled = true; btn.textContent = 'Committing…';
+    if (btn.disabled || !state.repo || state.repositoryOperation || state.syncPlan) return;
+    const context = currentRepositoryContext();
+    const operation = {};
+    state.repositoryOperation = operation;
+    updateChangeUI();
+    const oldText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Committing…';
     els['commit-error'].classList.add('hidden');
     try {
       await flushEditorSync();
-      if (!isCurrent()) return;
-      const snapshot = new Map([...state.changes].map(([path, change]) => [
-        path, {
-          ...change, sha: fileIndex.get(path)?.sha,
-          mode: fileIndex.get(path)?.mode || '100644',
-          renameFrom: fileIndex.get(path)?.renameFrom,
-        },
-      ]));
-      if (!snapshot.size) {
-        if (state.activeModal === 'commit-modal') closeModal();
-        return;
-      }
-      const result = provider === 'codeberg'
-        ? await repositoryClient(provider).commitFiles(owner, repo, branch, message, headSha, snapshot, isCurrent)
-        : await commitGitHubFiles({ owner, repo, branch, headSha, baseTreeSha }, message, snapshot, isCurrent);
-      if (!isCurrent() || !result) return;
-      const branchAdvanced = result.parentSha && result.parentSha !== headSha;
-      // Forgejo can accept a commit atop a concurrent update to unrelated files.
-      // Keep the old head check until a reload refreshes those files.
-      if (!branchAdvanced) {
-        state.headSha = result.sha;
-        state.baseTreeSha = result.treeSha;
-      }
-      acceptCommittedFiles(result.treeEntries, snapshot);
-      if (state.activeModal === 'commit-modal') closeModal();
-      const success = `Committed ${snapshot.size} change${snapshot.size === 1 ? '' : 's'} to ${branch}.`;
-      toast(branchAdvanced ? `${success} Reload to pick up other changes to this branch before committing again.` : success, 'success', 5000);
-    } catch (err) {
-      if (!isCurrent()) return;
-      const error = err.message || String(err);
-      if (state.activeModal === 'commit-modal') showInlineError(els['commit-error'], error);
-      else toast(error, 'error');
+      if (!context.isCurrent()) return;
+      const snapshot = selectedCommitFiles(state.commitReview);
+      if (!snapshot.size) throw new Error('Select at least one file to commit.');
+      const result = await publishCommit(context, message, snapshot);
+      if (result && state.activeModal === 'commit-modal') closeModal();
+    } catch (error) {
+      if (!context.isCurrent()) return;
+      if (state.activeModal === 'commit-modal') showInlineError(els['commit-error'], error.message);
+      else toast(error.message, 'error');
     } finally {
-      btn.disabled = false; btn.textContent = oldText;
+      btn.disabled = false;
+      btn.textContent = oldText;
+      finishRepositoryOperation(operation);
+    }
+  }
+
+  async function openBranchModal() {
+    if (!state.headSha || state.syncPlan || state.repositoryOperation) return;
+    if (!repositoryToken()) { openAuthModal(); return; }
+    const context = currentRepositoryContext();
+    try {
+      await flushEditorSync();
+      if (!context.isCurrent() || state.repositoryOperation) return;
+      const job = state.branchWorkflow;
+      const names = new Set([state.repo.default_branch, state.branch, ...state.branches.map(item => item.name)]);
+      els['branch-targets'].replaceChildren(...[...names].map(name => new Option(name, name)));
+      els['branch-name'].value = job?.name || '';
+      els['branch-current'].checked = job?.useCurrent || false;
+      els['branch-target'].value = job?.target || state.repo.default_branch;
+      els['branch-title'].value = job?.title || 'Update Typst project';
+      els['branch-body'].value = job?.body || '';
+      els['branch-message'].value = job?.message || 'Update Typst project';
+      els['branch-create-pr'].checked = job?.wantsPr ?? true;
+      els['branch-error'].classList.add('hidden');
+      state.branchReview = renderCommitReview(els['branch-files'], context, job && new Set(job.selection));
+      updateBranchWorkflowUI();
+      openModal('branch-modal');
+    } catch (error) {
+      if (context.isCurrent()) toast(error.message, 'error');
+    }
+  }
+
+  function updateBranchWorkflowUI() {
+    const job = state.branchWorkflow;
+    const progress = els['branch-progress'];
+    progress.replaceChildren();
+    if (job?.created && !job.useCurrent) progress.append(document.createTextNode(`Created branch ${job.name}. `));
+    if (job?.committed) progress.append(document.createTextNode(`Pushed commit ${job.committed.slice(0, 8)}. `));
+    if (job?.prUrl) {
+      const link = document.createElement('a');
+      link.href = job.prUrl;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.textContent = 'Open pull request';
+      progress.append(link);
+    }
+    els['branch-name'].disabled = Boolean(job?.attempted || els['branch-current'].checked);
+    els['branch-current'].disabled = Boolean(job?.attempted);
+    els['branch-review'].classList.toggle('hidden', Boolean(job?.committed || job?.done || !state.branchReview?.groups.length));
+    els['branch-pr-fields'].classList.toggle('hidden', !els['branch-create-pr'].checked || Boolean(job?.done));
+    els['branch-run-btn'].classList.toggle('hidden', Boolean(job?.done));
+    els['branch-reset-btn'].classList.toggle('hidden', !job);
+    els['branch-reset-btn'].disabled = Boolean(state.repositoryOperation);
+    els['branch-run-btn'].disabled = Boolean(state.repositoryOperation);
+    els['branch-run-btn'].textContent = state.repositoryOperation ? 'Working…' : job ? 'Retry / Continue' : 'Continue';
+  }
+
+  function resetBranchWorkflow() {
+    if (state.repositoryOperation) return;
+    state.branchWorkflow = null;
+    if (state.draft) { state.draft.headerDirty = true; queueDraftSave(); }
+    void openBranchModal();
+  }
+
+  async function saveBranchProgress() {
+    if (!state.draft) return;
+    state.draft.headerDirty = true;
+    if (!await persistDraft()) throw new Error('Could not save workflow progress on this device. Your draft remains open. Retry to save and continue.');
+  }
+
+  async function moveDraftToBranch(job, context) {
+    const draft = state.draft;
+    const previous = draft?.scope;
+    if (draft && previous !== job.destination) {
+      await saveBranchProgress();
+      if (!context.isCurrent()) return false;
+      state.draft = { account: draft.account, scope: job.destination, paths: new Set(state.changes.keys()),
+        source: { scope: previous, version: draft.version || 0 }, headerDirty: true };
+    }
+    state.branch = job.name;
+    if (!state.branches.some(item => item.name === job.name)) state.branches.unshift({ name: job.name });
+    renderBranches();
+    history.replaceState(null, '', repoHash(context.provider, context.owner, context.name, job.name));
+    addRecentProject();
+    await saveBranchProgress();
+    return true;
+  }
+
+  async function createWorkflowBranch(job, context) {
+    const { client, owner, name: repo } = context;
+    const ref = await client.getRef(owner, repo, job.name).catch(error => {
+      if (error.status !== 404) throw error;
+      return null;
+    });
+    if (!context.isCurrent()) return;
+    if (ref && (!job.attempted || ref.object.sha !== job.baseSha)) {
+      throw new Error(`Branch ${job.name} already exists. Choose a new name.`);
+    }
+    job.attempted = true;
+    await saveBranchProgress();
+    if (!context.isCurrent()) return;
+    if (!ref) {
+      try {
+        await client.createBranch(owner, repo, job.name, job.baseSha);
+      } catch (error) {
+        if (!context.isCurrent()) return;
+        const created = await client.getRef(owner, repo, job.name).catch(() => null);
+        if (created?.object?.sha !== job.baseSha) throw error;
+      }
+    }
+    job.created = true;
+  }
+
+  async function runBranchWorkflow() {
+    if (state.repositoryOperation || state.syncPlan || state.branchWorkflow?.done || !state.repo) return;
+    let context = currentRepositoryContext();
+    const operation = {};
+    state.repositoryOperation = operation;
+    updateChangeUI();
+    updateBranchWorkflowUI();
+    els['branch-error'].classList.add('hidden');
+    try {
+      await flushEditorSync();
+      if (!context.isCurrent()) return;
+      const previous = state.branchWorkflow;
+      const useCurrent = previous?.attempted ? previous.useCurrent : els['branch-current'].checked;
+      const name = previous?.attempted ? previous.name : useCurrent ? state.branch : els['branch-name'].value.trim();
+      const wantsPr = els['branch-create-pr'].checked;
+      const target = els['branch-target'].value.trim();
+      const title = els['branch-title'].value.trim();
+      const body = els['branch-body'].value;
+      const message = els['branch-message'].value.trim();
+      if (!name || (!useCurrent && name === state.branch && !previous?.created)) {
+        throw new Error('Enter a new branch name, or choose Use current branch.');
+      }
+      if (wantsPr && (!target || target === name || !title)) throw new Error('Choose a different target branch and enter a pull request title.');
+      const snapshot = previous?.committed ? new Map() : selectedCommitFiles(state.branchReview);
+      if (snapshot.size && !message) throw new Error('Enter a commit message for the selected files.');
+      const job = state.branchWorkflow = {
+        ...previous, useCurrent, name, target, title, body, message, wantsPr,
+        baseSha: previous?.baseSha || state.headSha,
+        selection: state.branchReview.groups.filter(group => group.checkbox.checked).map(group => group.path),
+        destination: state.draft && draftScope(state.draft.account, name),
+      };
+      if (useCurrent) job.created = true;
+      if (!job.created) {
+        if (job.destination && await working.readDraft(job.destination)) {
+          throw new Error(`A local draft already exists for ${name}. Open that branch to review it first.`);
+        }
+        if (!context.isCurrent()) return;
+        await createWorkflowBranch(job, context);
+        if (!context.isCurrent()) return;
+      }
+      updateBranchWorkflowUI();
+      if (state.branch !== name) {
+        if (!await moveDraftToBranch(job, context) || state.repositoryOperation !== operation) return;
+        context = currentRepositoryContext();
+      } else if (state.draft?.source) await saveBranchProgress();
+      if (snapshot.size && !job.committed) {
+        const result = await publishCommit(context, message, snapshot, job);
+        if (!result || !context.isCurrent()) return;
+        updateBranchWorkflowUI();
+        await saveBranchProgress();
+        if (!context.isCurrent()) return;
+      }
+      if (job.wantsPr && !job.prUrl) {
+        const { client, owner, name: repo } = context;
+        let pull;
+        try {
+          pull = await client.createPullRequest(owner, repo, name, target, title, body);
+        } catch (error) {
+          if (!context.isCurrent()) return;
+          pull = await client.findOpenPullRequest(owner, repo, name, target).catch(() => null);
+          if (!pull) throw error;
+        }
+        if (!context.isCurrent()) return;
+        const url = new URL(pull.html_url);
+        const host = context.provider === 'codeberg' ? 'codeberg.org' : 'github.com';
+        if (url.protocol !== 'https:' || url.hostname !== host) throw new Error('The provider returned an invalid pull request link.');
+        job.prUrl = url.href;
+      }
+      job.done = true;
+      try { await saveBranchProgress(); } catch (error) { job.done = false; throw error; }
+      if (context.isCurrent()) toast(job.prUrl ? 'Pull request is ready.' : `Branch ${name} is ready.`, 'success');
+    } catch (error) {
+      if (state.repositoryOperation === operation) {
+        if (state.activeModal === 'branch-modal') showInlineError(els['branch-error'], error.message);
+        else toast(error.message, 'error', 6000);
+      }
+    } finally {
+      if (state.repositoryOperation === operation) {
+        finishRepositoryOperation(operation);
+        updateBranchWorkflowUI();
+      }
     }
   }
 
   async function commitGitHubFiles({ owner, repo, branch, headSha, baseTreeSha }, message, snapshot, isCurrent) {
     const latestRef = await github.getRef(owner, repo, branch);
     if (!isCurrent()) return;
-    if (latestRef.object.sha !== headSha) throw new Error('The branch changed on GitHub after you opened it. Reload the project before committing so you do not overwrite somebody else’s work.');
+    if (latestRef.object.sha !== headSha) throw new Error('The branch changed on GitHub. Sync remote changes before committing.');
     const treeEntries = [];
     for (const [path, { type, mode, bytes }] of snapshot) {
       const sha = type === 'delete' ? null : (await github.createBlob(owner, repo, bytes)).sha;
@@ -3710,7 +5022,13 @@
     if (!isCurrent()) return;
     const commit = await github.createCommit(owner, repo, message, tree.sha, headSha);
     if (!isCurrent()) return;
-    await github.updateRef(owner, repo, branch, commit.sha);
+    try {
+      await github.updateRef(owner, repo, branch, commit.sha);
+    } catch (error) {
+      if (!isCurrent()) return;
+      const ref = await github.getRef(owner, repo, branch).catch(() => null);
+      if (ref?.object?.sha !== commit.sha) throw error;
+    }
     return { sha: commit.sha, treeSha: tree.sha, treeEntries };
   }
 
@@ -3723,6 +5041,7 @@
       const pending = present && state.editorSyncPending && state.editorSyncPath === path;
       const bytes = snapshot.get(path).bytes;
       if (sha === null) {
+        state.baseFiles.delete(path);
         state.originalBytes.delete(path);
         state.deletedPaths.delete(path);
         if (present) state.fileIndex.set(path, { path, mode, type: 'blob', size: meta.size, existing: false });
@@ -3732,7 +5051,9 @@
           state.sourceTextCache.delete(path);
         }
       } else {
-        state.fileIndex.set(path, { path, mode, type: 'blob', sha, size: bytes.length, existing: true });
+        const base = { path, mode, type: 'blob', sha, size: bytes.length, existing: true };
+        state.baseFiles.set(path, base);
+        state.fileIndex.set(path, base);
         state.originalBytes.set(path, bytes);
         if (!present) state.deletedPaths.add(path);
       }
@@ -3740,11 +5061,21 @@
       const workingBytes = state.fileBytes.get(path);
       if (present && (pending || !sameBytes(workingBytes, bytes))) {
         const type = sha === null ? 'add' : 'modify';
-        state.changes.set(path, pending ? { type, pending: true } : { type, bytes: workingBytes });
-      } else if (!present && sha !== null) state.changes.set(path, { type: 'delete' });
-      else state.changes.delete(path);
+        setWorkingChange(path, pending ? { type, pending: true } : { type, bytes: workingBytes });
+      } else if (!present && sha !== null) setWorkingChange(path, { type: 'delete' });
+      else setWorkingChange(path, null);
       updateFileTreeDirtyIndicator(path);
     }
+    // A renamed destination can itself be renamed while the push runs.
+    const movedSources = new Map();
+    for (const [destination, change] of snapshot) {
+      if (change.renameFrom && state.changes.get(destination)?.type === 'delete') movedSources.set(change.renameFrom, destination);
+    }
+    for (const [path, change] of state.changes) {
+      if (!change.renameFrom || state.changes.get(change.renameFrom)?.type === 'delete') continue;
+      setWorkingChange(path, { ...change, renameFrom: movedSources.get(change.renameFrom) });
+    }
+    state.rawTree = [...state.baseFiles.values(), ...state.rawTree.filter(item => item.type !== 'blob' && item.type !== 'tree')];
     els['file-count-label'].textContent = `${effectivePaths().length} files`;
     updateChangeUI();
   }
@@ -3822,7 +5153,7 @@
     els['auth-modal-title'].textContent = `Connect ${repositoryProviderLabel(provider)}`;
     els['auth-token-copy'].textContent = codeberg
       ? 'Use a personal access token with write:repository to edit projects. The token goes directly to the Codeberg API.'
-      : 'Use a fine-grained personal access token with Contents: Read and write access to the repositories you want to edit. The token goes directly to the GitHub API.';
+      : 'Give your fine-grained token read and write access to Contents for the repositories you edit. To open pull requests, also give it write access to Pull requests. The token goes directly to the GitHub API.';
     els['auth-token-help'].textContent = codeberg
       ? 'Open Codeberg → Settings → Applications → Manage Access Tokens. To use a token limited to specific repositories, open its repository URL in the editor first. Account lookup and listing your repositories use read:user.'
       : 'GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens. Give it access only to the repos your group edits.';
@@ -3840,7 +5171,7 @@
     const token = els['github-token-input'].value.trim();
     if (!token) return showInlineError(els['auth-error'], `Paste a ${label} personal access token.`);
     const btn = els['save-github-token-btn'];
-    if (btn.disabled) return;
+    if (btn.disabled || state.repositoryOperation) return;
     const remember = els['remember-token-checkbox'].checked;
     const attempt = ++state.authAttempt;
     const isCurrent = () => attempt === state.authAttempt && state.activeModal === 'auth-modal';
@@ -3864,13 +5195,18 @@
         await client.getRepo(project.owner, project.repo, token);
       }
       if (!isCurrent()) return;
+      if (!await persistDraft()) throw new Error('Save the local draft before changing accounts.');
+      if (!isCurrent()) return;
       saveToken(token, remember, provider);
       if (provider === 'codeberg') state.codebergProfile = profile || null;
       else state.profile = profile;
       updateAccountUI();
       closeModal();
       toast(profile?.login ? `Connected to ${label} as ${profile.login}.` : `Connected to ${label} for this repository.`, 'success');
-      if (location.hash === locationAtStart && parseHash().provider === provider && !state.headSha) route();
+      if (location.hash === locationAtStart && parseHash().provider === provider) {
+        if (!state.headSha) route();
+        else await changeDraftAccount(provider, true);
+      }
     } catch (err) {
       if (isCurrent()) showInlineError(els['auth-error'], `Could not connect to ${label}. ${err.message}`);
     } finally {
@@ -3938,7 +5274,7 @@
   function setCompileStatus(kind, text) {
     const el = els['compile-status']; el.className = `status-pill ${kind}`; el.querySelector('span:last-child').textContent = text;
   }
-  function setSyncStatus(text) { els['repo-sync-status'].textContent = text; }
+  function setSyncStatus(text) { if (els['repo-sync-status']) els['repo-sync-status'].textContent = text; }
   function toast(message, type = '', duration = 3500) {
     const el = document.createElement('div'); el.className = `toast ${type}`; el.textContent = message; els['toast-root'].appendChild(el);
     setTimeout(() => { el.style.opacity = '0'; el.style.transform = 'translateY(8px)'; setTimeout(()=>el.remove(),180); }, duration);

@@ -5,7 +5,9 @@ const http = require('node:http');
 const assert = require('node:assert/strict');
 const { chromium } = require('playwright');
 const root = path.resolve(__dirname, '..');
+const mirror = process.env.TYPST_CDN_HELPER ? require(process.env.TYPST_CDN_HELPER) : null;
 const server = http.createServer((req, res) => {
+  if (mirror?.staticAssets(req, res)) return;
   if (req.url === '/favicon.ico') { res.writeHead(204).end(); return; }
   const file = path.join(root, req.url === '/' ? 'index.html' : req.url);
   if (!file.startsWith(root + path.sep) || !fs.existsSync(file)) { res.writeHead(404).end(); return; }
@@ -13,14 +15,18 @@ const server = http.createServer((req, res) => {
   if (file.endsWith('app.js')) body = body.toString().replace(/  boot\(\)\.catch\(err => \{[\s\S]*?\n  \}\);\n\}\)\(\);\s*$/, `
     cacheElements(); loadTheme(); bindEvents();
     window.testApp = { state, els, ensureMonaco, ensureTypstRuntime, compilePreview, openFile, openFileAtOffset,
-      schedulePreviewSourceAnchorIndexing, settleEditorLayout };
+      schedulePreviewSourceAnchorIndexing, settleEditorLayout, renderDiagnostics };
   })();`);
   res.setHeader('Content-Type', file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : 'text/html');
-  res.end(body);
+  res.end(mirror ? mirror.rewrite(body.toString()) : body);
 });
 (async () => {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  const browser = await chromium.launch({ ...(process.env.BROWSER_CHANNEL ? { channel: process.env.BROWSER_CHANNEL } : {}), headless: true });
+  const browser = await chromium.launch({
+    ...(process.env.BROWSER_CHANNEL ? { channel: process.env.BROWSER_CHANNEL } : {}),
+    ...(process.env.BROWSER_EXECUTABLE ? { executablePath: process.env.BROWSER_EXECUTABLE } : {}),
+    headless: true,
+  });
   const timeout = setTimeout(() => browser.close(), 120000);
   try {
     const page = await browser.newPage({ viewport: { width: 1500, height: 960 } });
@@ -149,6 +155,90 @@ const server = http.createServer((req, res) => {
       return editor.getValue() === beforeThemeEdit;
     }));
     await page.waitForFunction(() => !testApp.state.changes.size && !testApp.state.compileInFlight);
+
+    const tabs = page.getByRole('group', { name: 'Open files' });
+    const chapter = 'sections/chapter.typ';
+    const activeTab = (path) => tabs.getByRole('button', { name: path, exact: true });
+    await page.evaluate(() => {
+      const { editor } = testApp.state;
+      editor.executeEdits('test', [{ range: new monaco.Range(1, 1, 1, 1), text: '// tab edit\n' }]);
+      editor.pushUndoStop();
+      editor.setSelection(new monaco.Selection(50, 4, 50, 9));
+      editor.setScrollTop(850, monaco.editor.ScrollType.Immediate);
+      window.tabBefore = { model: editor.getModel(), selection: editor.getSelection(), scroll: editor.getScrollTop() };
+    });
+    await activeTab('main.typ').click();
+    await page.waitForFunction(() => testApp.state.openPath === 'main.typ');
+    const dirtyChapter = activeTab(`${chapter}, uncommitted changes`);
+    await dirtyChapter.locator('.dirty-dot').waitFor({ state: 'visible' });
+    await dirtyChapter.click();
+    await page.waitForFunction(path => testApp.state.openPath === path, chapter);
+    await page.waitForTimeout(100);
+    assert(await page.evaluate(() => {
+      const { editor } = testApp.state;
+      const { model, selection, scroll } = tabBefore;
+      return editor.getModel() === model && editor.getSelection().equalsSelection(selection) &&
+        editor.getScrollTop() === scroll && model.canUndo();
+    }), 'Switching tabs preserves selection, viewport, model, and undo.');
+    await page.keyboard.press('ControlOrMeta+z');
+    await page.waitForFunction(() => !testApp.state.changes.size && !testApp.state.compileInFlight);
+    assert.equal(await page.evaluate(() => testApp.state.editor.getValue()), await page.evaluate(() => beforeThemeEdit));
+    await page.evaluate(() => testApp.state.editor.executeEdits('test', [{ range: new monaco.Range(1, 1, 1, 1), text: '// retained after close\n' }]));
+    await tabs.getByRole('button', { name: `Close ${chapter}`, exact: true }).click();
+    await page.waitForFunction(() => testApp.state.openPath === 'main.typ');
+    assert.equal(await dirtyChapter.count(), 0);
+    await page.locator('.file-row').filter({ hasText: 'chapter.typ' }).click();
+    await page.waitForFunction(() => testApp.state.editor.getValue().startsWith('// retained after close'));
+    console.log('PASS tabs retain selection, scroll and undo, and closing retains working edits');
+
+    await page.setViewportSize({ width: 390, height: 740 });
+    const panes = page.getByRole('navigation', { name: 'Workspace panes' });
+    await panes.getByRole('button', { name: 'Files' }).click();
+    await page.locator('#file-sidebar').waitFor({ state: 'visible' });
+    await page.locator('#code-pane').waitFor({ state: 'hidden' });
+    await page.locator('.file-row').filter({ hasText: 'main.typ' }).click();
+    await page.locator('#code-pane').waitFor({ state: 'visible' });
+    await page.waitForFunction(() => testApp.state.openPath === 'main.typ');
+    await panes.getByRole('button', { name: 'Preview' }).click();
+    await page.locator('#preview-pane').waitFor({ state: 'visible' });
+    await text.waitFor({ state: 'visible' });
+    await page.locator('#zoom-in-btn').click();
+    const previewState = () => page.locator('#preview-scroll').evaluate(el => [el.scrollTop, el.scrollLeft, testApp.state.previewZoom]);
+    await page.locator('#preview-scroll').evaluate(el => { el.scrollTop = 90; el.scrollLeft = 42; });
+    const beforePane = await previewState();
+    assert(beforePane[0] > 0 && beforePane[1] > 0);
+    await panes.getByRole('button', { name: 'Editor' }).click();
+    await panes.getByRole('button', { name: 'Preview' }).click();
+    assert.deepEqual(await previewState(), beforePane, 'Preview pane retains zoom and scroll.');
+    await text.click();
+    await page.waitForFunction(path => testApp.state.openPath === path, chapter);
+    assert.equal(await panes.getByRole('button', { name: 'Editor' }).getAttribute('aria-pressed'), 'true');
+    assert(await page.evaluate(() => testApp.state.editor.getPosition().lineNumber >= 183));
+
+    await page.evaluate(path => testApp.renderDiagnostics([{
+      path, severity: 'warning', message: 'Test warning in chapter',
+      range: { startLine: 60, startColumn: 1, endLine: 60, endColumn: 5 },
+    }]), chapter);
+    await panes.getByRole('button', { name: 'Preview' }).click();
+    await page.locator('.diagnostic-main').filter({ hasText: 'Test warning in chapter' }).click();
+    assert.equal(await panes.getByRole('button', { name: 'Editor' }).getAttribute('aria-pressed'), 'true');
+    assert.equal(await page.evaluate(() => testApp.state.editor.getPosition().lineNumber), 61);
+    console.log('PASS narrow panes retain state and both preview and diagnostic links reveal source');
+
+    await page.evaluate(() => { window.beforeRename = testApp.state.editor.getModel(); });
+    await panes.getByRole('button', { name: 'Files' }).click();
+    await page.locator('#rename-file-btn').click();
+    await page.locator('#text-prompt-input').fill('sections/renamed.typ');
+    await page.locator('#text-prompt-confirm').click();
+    await page.waitForFunction(() => testApp.state.openPath === 'sections/renamed.typ');
+    assert(await page.evaluate(() => testApp.state.editor.getModel() === beforeRename && !testApp.state.openTabs.has('sections/chapter.typ')));
+    await panes.getByRole('button', { name: 'Files' }).click();
+    page.once('dialog', dialog => dialog.accept());
+    await page.locator('#delete-file-btn').click();
+    await page.waitForFunction(() => testApp.state.openPath === 'main.typ');
+    assert.equal(await tabs.getByRole('button', { name: 'Close sections/renamed.typ' }).count(), 0);
+    console.log('PASS renaming retains the model and deletion removes its tab');
+
     await page.reload();
     await page.waitForFunction(() => document.documentElement.dataset.theme === 'light');
     assert.equal(await theme.getAttribute('aria-pressed'), 'true');

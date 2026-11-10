@@ -1,7 +1,9 @@
 *
 !/index.html
 !/app.js
+!/working-state.js
 !/typst-worker.js
 !/grammar-worker.js
 !/codeberg.js
+!/project-tools.js
 !/styles.css
